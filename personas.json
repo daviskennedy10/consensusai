@@ -1,0 +1,38 @@
+{
+  "maya": {
+    "seed": "consensusai-demo-maya-seed",
+    "port": 8101,
+    "hard": {
+      "max_price": 25,
+      "max_distance_min": 20,
+      "dietary": ["vegetarian"],
+      "free_slots": ["2026-10-23T19:00", "2026-10-24T19:00", "2026-10-25T18:00"]
+    },
+    "cuisine_pref": {"thai": 1.0, "fusion": 0.8, "mediterranean": 0.7, "italian": 0.6, "burger": 0.1},
+    "weights": {"cuisine": 1.0, "rating": 0.8, "distance": 0.5, "price": 0.6}
+  },
+  "jordan": {
+    "seed": "consensusai-demo-jordan-seed",
+    "port": 8102,
+    "hard": {
+      "max_price": 40,
+      "max_distance_min": 30,
+      "dietary": [],
+      "free_slots": ["2026-10-23T19:00", "2026-10-24T19:00"]
+    },
+    "cuisine_pref": {"burger": 1.0, "italian": 0.8, "fusion": 0.7, "thai": 0.5, "mediterranean": 0.4},
+    "weights": {"cuisine": 0.6, "rating": 1.0, "distance": 0.3, "price": 0.3}
+  },
+  "sam": {
+    "seed": "consensusai-demo-sam-seed",
+    "port": 8103,
+    "hard": {
+      "max_price": 30,
+      "max_distance_min": 15,
+      "dietary": ["halal"],
+      "free_slots": ["2026-10-24T19:00", "2026-10-25T18:00"]
+    },
+    "cuisine_pref": {"mediterranean": 1.0, "burger": 0.6, "fusion": 0.5, "thai": 0.4},
+    "weights": {"cuisine": 0.5, "rating": 0.4, "distance": 0.8, "price": 1.0}
+  }
+}

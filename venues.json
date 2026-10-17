@@ -1,0 +1,8 @@
+[
+  {"id": "med-grill", "name": "Med Grill", "cuisine": "mediterranean", "price": 22, "distance_min": 12, "rating": 4.1, "tags": ["vegetarian", "halal"]},
+  {"id": "garden-fusion", "name": "Garden Fusion", "cuisine": "fusion", "price": 24, "distance_min": 14, "rating": 4.9, "tags": ["vegetarian", "halal"]},
+  {"id": "thai-orchid", "name": "Orchid Thai", "cuisine": "thai", "price": 18, "distance_min": 10, "rating": 4.4, "tags": ["vegetarian"]},
+  {"id": "burger-barn", "name": "Burger Barn", "cuisine": "burger", "price": 15, "distance_min": 8, "rating": 4.6, "tags": ["halal"]},
+  {"id": "pasta-casa", "name": "Pasta Casa", "cuisine": "italian", "price": 28, "distance_min": 18, "rating": 4.5, "tags": ["vegetarian"]},
+  {"id": "prime-steak", "name": "Prime Steakhouse", "cuisine": "steak", "price": 45, "distance_min": 10, "rating": 4.8, "tags": ["halal"]}
+]
