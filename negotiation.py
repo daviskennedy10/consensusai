@@ -77,15 +77,25 @@ def near_misses(replies, limit=3) -> List[NearMiss]:
 
 
 def counteroffers(replies, candidates, limit=3) -> List[Counteroffer]:
-    """One question per blocking person per near miss. Never mentions anyone else."""
+    """At most one question per blocking person (their best near miss), so each owner
+    faces a single decision. Never mentions anyone else."""
     by_id = {c.id: c for c in candidates}
-    out = []
+    out, asked = [], set()
     for m in near_misses(replies, limit):
         c = by_id[m.candidate_id]
         for person, category in sorted(m.blockers.items()):
+            if person in asked:
+                continue
+            asked.add(person)
             q = QUESTIONS.get(category, QUESTIONS['availability']).format(name=c.name, when=when(c.slot))
             out.append(Counteroffer(person, c.id, category, q + ' It would unlock a plan for the whole group.'))
     return out
+
+
+def unlocked(misses, answers) -> Optional[str]:
+    """First near miss whose every blocker accepted the counteroffer for it.
+    `answers` maps (person, candidate_id) -> accepted."""
+    return next((m.candidate_id for m in misses if all(answers.get((p, m.candidate_id)) for p in m.blockers)), None)
 
 
 def minimal_relaxation(persona, c) -> Optional[dict]:
