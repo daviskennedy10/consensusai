@@ -14,6 +14,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -58,18 +60,41 @@ class Proposal:
     source: str         # 'stepfun' | 'command' | 'none'
 
 
-def stepfun_chat(system, user, timeout=30):
-    key = os.environ.get('STEPFUN_API_KEY')
+class StepFunError(RuntimeError):
+    pass
+
+
+STEPFUN_HINTS = {401: 'check STEP_API_KEY', 402: 'check the StepFun balance or voucher',
+                 403: 'check account permissions, balance and model access', 404: 'model not enabled for this account',
+                 429: 'rate or quota limit, try again shortly'}
+RETRY_STATUS = {429, 500, 502, 503, 504}
+RETRY_DELAYS = (1, 3)  # StepFun: "429 means retry with backoff". Timeouts are not retried (already 30 s).
+
+
+def stepfun_chat(system, user, timeout=30, sleep=time.sleep):
+    """THE Step 5 Preview call: one chat message in, a JSON delta out."""
+    key = (os.environ.get('STEP_API_KEY') or os.environ.get('STEPFUN_API_KEY') or '').strip()
     if not key:
-        raise RuntimeError('STEPFUN_API_KEY is not set')
-    # Hidden reasoning counts against max_tokens; 800 left some answers empty. Low effort: ~9 s.
-    body = {'model': STEPFUN_MODEL, 'temperature': 0, 'max_tokens': 4000, 'reasoning_effort': 'low',
+        raise StepFunError('STEP_API_KEY is not set')
+    # Hidden reasoning counts against max_tokens; 800 left some answers empty. Low effort: ~3-9 s.
+    body = {'model': STEPFUN_MODEL, 'temperature': 0, 'max_tokens': 4096, 'reasoning_effort': 'low',
             'response_format': {'type': 'json_object'},
             'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]}
     req = urllib.request.Request(STEPFUN_URL, data=json.dumps(body).encode(), method='POST',
                                  headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())['choices'][0]['message']['content']
+    for delay in (*RETRY_DELAYS, None):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                choice = json.loads(r.read())['choices'][0]
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in RETRY_STATUS and delay is not None:
+                sleep(delay)
+                continue
+            raise StepFunError(f"StepFun HTTP {e.code}: {STEPFUN_HINTS.get(e.code, 'request failed')}") from None
+    if choice.get('finish_reason') == 'length':
+        raise StepFunError('StepFun answer was cut off at max_tokens')
+    return choice['message'].get('content') or ''
 
 
 def slots_line(slots):
@@ -176,7 +201,8 @@ def propose(text, persona, llm: Callable[[str, str], str] = stepfun_chat, slots=
     try:
         raw = parse_json(llm(SYSTEM + slots_line(slots), text))
     except Exception as e:  # network, auth, timeout, bad JSON: never crash the agent
-        return Proposal({}, '', (f'language model unavailable ({type(e).__name__}); try: set max_price 30',), 'none')
+        reason = str(e) if isinstance(e, StepFunError) else type(e).__name__
+        return Proposal({}, '', (f'language model unavailable ({reason}); try: set max_price 30',), 'none')
     update, rejected = to_update(raw, persona, slots)
     return Proposal(update, summary(persona, update), rejected, 'stepfun')
 
