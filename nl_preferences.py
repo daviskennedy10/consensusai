@@ -31,8 +31,9 @@ DEMO_SLOTS = ('2026-10-23T19:00', '2026-10-24T19:00', '2026-10-25T18:00')  # org
 VENUE_CUISINES = tuple(sorted({v['cuisine'] for v in json.loads((Path(__file__).resolve().parent / 'venues.json').read_text())}))
 
 NUMBER_FIELDS = ('max_price', 'comfort_price', 'max_distance_min', 'comfort_distance_min')
-LIST_FIELDS = ('dietary', 'never_cuisines', 'free_slots', 'preferred_slots')
+LIST_FIELDS = ('dietary', 'never_cuisines', 'free_slots', 'preferred_slots', 'busy_days')
 SLOT_FIELDS = ('free_slots', 'preferred_slots')
+DAY_FIELDS = ('busy_days',)
 WEIGHT_KEYS = ('cuisine', 'rating', 'distance', 'price')
 KNOWN_KEYS = set(NUMBER_FIELDS) | {f'{f}_{op}' for f in LIST_FIELDS for op in ('add', 'remove')} | {'cuisine_pref', 'weights'}
 
@@ -45,11 +46,12 @@ Use only these optional keys and omit anything the message does not state:
 - cuisine_pref: object cuisine -> score 0..1 (1 love, 0.5 neutral, 0 dislike) for soft likes and dislikes.
 - free_slots_add, free_slots_remove: KNOWN SLOTS they can / cannot attend.
 - preferred_slots_add, preferred_slots_remove: KNOWN SLOTS they would rather have (soft).
+- busy_days_add, busy_days_remove: KNOWN DAYS (YYYY-MM-DD) they cannot make at all / can make again.
 - weights: object with any of cuisine, rating, distance, price -> importance 0..10.
 Use lowercase names, the KNOWN CUISINES spelling when one matches, and exact KNOWN SLOTS strings.
 Output {} if nothing applies. Output JSON only.
 KNOWN CUISINES: """ + ', '.join(VENUE_CUISINES) + """
-KNOWN SLOTS: """
+KNOWN SLOTS AND DAYS: """
 
 
 @dataclass(frozen=True)
@@ -97,8 +99,9 @@ def stepfun_chat(system, user, timeout=30, sleep=time.sleep):
     return choice['message'].get('content') or ''
 
 
-def slots_line(slots):
-    return '; '.join(f'{s} = {datetime.fromisoformat(s):%A} {when(s)}' for s in slots)
+def slots_line(slots, days=()):
+    line = '; '.join(f'{s} = {datetime.fromisoformat(s):%A} {when(s)}' for s in slots)
+    return line + ('\nDAYS: ' + '; '.join(f'{d} = {datetime.fromisoformat(d):%A %b} {int(d[8:])}' for d in days) if days else '')
 
 
 def parse_json(text):
@@ -119,7 +122,7 @@ def number(v):
     return int(v) if v.is_integer() else v
 
 
-def to_update(raw, persona, slots=DEMO_SLOTS):
+def to_update(raw, persona, slots=DEMO_SLOTS, days=()):
     """Apply the model's delta to the persona's current values -> (update, rejected)."""
     update, rejected = {}, [f'{k}: unknown field' for k in raw if k not in KNOWN_KEYS]
     known = set(VENUE_CUISINES) | set(persona['cuisine_pref'])
@@ -135,16 +138,17 @@ def to_update(raw, persona, slots=DEMO_SLOTS):
         if not isinstance(add, list) or not isinstance(rem, list) or not all(isinstance(x, str) for x in add + rem):
             rejected.append(f'{f}: expected lists of text')
             continue
-        if f in SLOT_FIELDS:
+        if f in SLOT_FIELDS or f in DAY_FIELDS:
             norm = str.strip
         elif f == 'never_cuisines':
             norm = lambda x: cuisine(x.strip().lower())
         else:
             norm = lambda x: x.strip().lower()
         add, rem = [norm(x) for x in add], [norm(x) for x in rem]
-        if f in SLOT_FIELDS:
-            rejected += [f'{f}: unknown slot {x}' for x in add + rem if x not in slots]
-            add, rem = [x for x in add if x in slots], [x for x in rem if x in slots]
+        if f in SLOT_FIELDS or f in DAY_FIELDS:
+            allowed = slots if f in SLOT_FIELDS else days
+            rejected += [f'{f}: unknown {"slot" if f in SLOT_FIELDS else "day"} {x}' for x in add + rem if x not in allowed]
+            add, rem = [x for x in add if x in allowed], [x for x in rem if x in allowed]
         if add or rem:
             current = (persona.get('soft', {}) if f == 'preferred_slots' else persona['hard']).get(f, [])
             update[f] = [x for x in current if x not in rem] + [x for x in add if x not in current]
@@ -177,7 +181,8 @@ def summary(persona, update):
     for k, new in update.items():
         old = current(persona, k)
         if k in LIST_FIELDS:
-            old, fmt = old or [], (when if k in SLOT_FIELDS else str)
+            day = lambda d: f'{datetime.fromisoformat(d):%a %b} {int(d[8:])}'
+            old, fmt = old or [], (when if k in SLOT_FIELDS else day if k in DAY_FIELDS else str)
             lines += [f'{k}: + {fmt(x)}' for x in new if x not in old] + [f'{k}: - {fmt(x)}' for x in old if x not in new]
         elif k == 'weights':  # scales differ, so compare each factor's share of the decision
             share = lambda w, c: w.get(c, 0) / sum(w.values())
@@ -190,7 +195,7 @@ def summary(persona, update):
     return '\n'.join(lines) or 'No preference changes found.'
 
 
-def propose(text, persona, llm: Callable[[str, str], str] = stepfun_chat, slots=DEMO_SLOTS) -> Proposal:
+def propose(text, persona, llm: Callable[[str, str], str] = stepfun_chat, slots=DEMO_SLOTS, days=()) -> Proposal:
     if re.match(r'\s*set\s', text, re.I):
         try:
             update = parse_update(text)
@@ -199,11 +204,11 @@ def propose(text, persona, llm: Callable[[str, str], str] = stepfun_chat, slots=
             return Proposal({}, '', (str(e),), 'command')
         return Proposal(update, summary(persona, update), (), 'command')
     try:
-        raw = parse_json(llm(SYSTEM + slots_line(slots), text))
+        raw = parse_json(llm(SYSTEM + slots_line(slots, days), text))
     except Exception as e:  # network, auth, timeout, bad JSON: never crash the agent
         reason = str(e) if isinstance(e, StepFunError) else type(e).__name__
         return Proposal({}, '', (f'language model unavailable ({reason}); try: set max_price 30',), 'none')
-    update, rejected = to_update(raw, persona, slots)
+    update, rejected = to_update(raw, persona, slots, days)
     return Proposal(update, summary(persona, update), rejected, 'stepfun')
 
 

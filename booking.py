@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 API = 'https://api.browser-use.com/api/v2'
-MAX_STEPS = 25          # bounds cost; the v2 API has no stop-task call
-TIMEOUT_S = 240
+MAX_STEPS = 20          # bounds cost; the v2 API has no stop-task call
+TIMEOUT_S = 180         # live checks took 21 s to 3 min
 POLL_S = 3
 DONE = {'finished', 'failed', 'stopped'}
 RESULT_SCHEMA = json.dumps({
