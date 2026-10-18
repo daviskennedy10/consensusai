@@ -32,10 +32,10 @@ class BookingTests(unittest.TestCase):
     def test_available_slot_is_ready_but_not_booked(self):
         api = FakeAPI(['created', 'started', 'finished'],
                       {'outcome': 'available', 'bookable_times': ['6:45 PM', '7:15 PM'],
-                       'booking_url': 'https://www.opentable.com/booking/details?rid=1'})
+                       'platform': 'opentable', 'restaurant_page_url': 'https://www.opentable.com/r/water-grill-los-angeles'})
         b = run(api)
         self.assertEqual((b.status, b.task_id, b.cost), ('ready', 't1', '0.07'))
-        self.assertEqual(b.link, 'https://www.opentable.com/booking/details?rid=1')
+        self.assertEqual(b.link, 'https://www.opentable.com/r/water-grill-los-angeles?dateTime=2026-10-24T19%3A00&covers=3')
         self.assertIn('Not booked yet', message(b))
         self.assertIn('6:45 PM', message(b))
 
@@ -54,6 +54,12 @@ class BookingTests(unittest.TestCase):
         b = run(FakeAPI(['finished'], {'outcome': 'unavailable', 'bookable_times': ['9:30 PM']}))
         self.assertEqual(b.status, 'unavailable')
         self.assertIn('9:30 PM', message(b))
+
+    def test_no_reservations_means_walk_in(self):
+        b = run(FakeAPI(['finished'], {'outcome': 'no_reservations', 'notes': 'walk-in only'}))
+        self.assertEqual(b.status, 'walk_in')
+        self.assertEqual(message(b), "Water Grill doesn't take reservations: just walk in.")
+        self.assertIn('no_reservations', booking.RESULT_SCHEMA)
 
     def test_every_failure_falls_back_to_a_link(self):
         cases = {
@@ -84,9 +90,25 @@ class BookingTests(unittest.TestCase):
                 os.environ['BROWSER_USE_API_KEY'] = old
         self.assertEqual(b.status, 'fallback')
 
-    def test_untrusted_urls_are_replaced(self):
-        b = run(FakeAPI(['finished'], {'outcome': 'available', 'booking_url': 'javascript:alert(1)'}))
-        self.assertTrue(b.link.startswith('https://www.opentable.com/s?'))
+    def test_untrusted_and_session_urls_are_replaced(self):
+        for url in ('javascript:alert(1)', 'http://www.exploretock.com/x',
+                    'https://www.exploretock.com/la-bruschetta/checkout/edit-guest-profile',
+                    'https://www.opentable.com/booking/details?availabilityToken=abc&rid=1'):
+            b = run(FakeAPI(['finished'], {'outcome': 'available', 'platform': 'tock', 'restaurant_page_url': url}))
+            self.assertTrue(b.link.startswith('https://www.opentable.com/s?'), url)
+
+    def test_share_links_prefill_date_time_and_party(self):
+        fb = 'https://fallback'
+        self.assertEqual(booking.share_link('tock', 'https://www.exploretock.com/la-bruschetta', SLOT, 3, fb),
+                         'https://www.exploretock.com/la-bruschetta/search?date=2026-10-24&size=3&time=19%3A00')
+        self.assertEqual(booking.share_link('tock', 'https://www.exploretock.com/la-bruschetta/search?date=x', SLOT, 2, fb),
+                         'https://www.exploretock.com/la-bruschetta/search?date=2026-10-24&size=2&time=19%3A00')
+        self.assertEqual(booking.share_link('resy', 'https://resy.com/cities/la/venues/bestia', SLOT, 4, fb),
+                         'https://resy.com/cities/la/venues/bestia?date=2026-10-24&seats=4')
+        self.assertEqual(booking.share_link('own_site', 'https://lab.example.com/reserve?utm=x', SLOT, 2, fb),
+                         'https://lab.example.com/reserve')
+        self.assertEqual(booking.share_link('tock', 'https://evil.example.com/tock', SLOT, 2, fb), 'https://evil.example.com/tock')
+        self.assertEqual(booking.share_link(None, None, SLOT, 2, fb), fb)
 
     def test_party_size_validated(self):
         for size in (0, 21):

@@ -12,6 +12,7 @@ from uagents.crypto import Identity
 from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage, TextContent, chat_protocol_spec
 from models import Candidate, ScoreReply, ScoreRequest
 from scoring import choose, build_complete_table
+from coordination import Plan
 
 BASE=Path(__file__).resolve().parent
 personas=json.loads((BASE/'personas.json').read_text())
@@ -23,16 +24,6 @@ SLOTS={1:['2026-10-23T19:00','2026-10-24T19:00'],2:['2026-10-23T19:00','2026-10-
 agent=Agent(name='consensusai-organizer',seed=os.environ.get('ORGANIZER_SEED','change-me-organizer-seed'),port=8000,mailbox=True)
 chat=Protocol(spec=chat_protocol_spec)
 
-class Plan:
-    def __init__(self,user):
-        self.id=uuid4().hex[:8]
-        self.user=user
-        self.round=1
-        self.replies={}
-        self.candidates=[]
-        self.t0=time.monotonic()
-        self.finalizing=False
-
 plans={}
 
 def candidates(round_no):
@@ -41,17 +32,22 @@ def candidates(round_no):
 async def say(ctx,to,text):
     await ctx.send(to,ChatMessage(timestamp=datetime.now(timezone.utc),msg_id=uuid4(),content=[TextContent(type='text',text=text)]))
 
-async def broadcast(ctx,plan):
-    plan.replies={}
-    plan.candidates=candidates(plan.round)
-    plan.t0=time.monotonic()
-    plan.finalizing=False
-    req=ScoreRequest(plan_id=plan.id,round=plan.round,candidates=plan.candidates)
-    for name,addr in ADDR.items():
+async def broadcast(ctx, plan):
+    plan.begin_round(candidates(plan.round))
+    req = plan.make_request()
+
+    for name, addr in plan.participants.items():
         try:
-            await ctx.send(addr,req)
+            await ctx.send(addr, req)
+            ctx.logger.info(
+                "Sent scoring request to %s for plan %s",
+                name, plan.id
+            )
         except Exception as exc:
-            ctx.logger.error('Send failed to %s: %s',name,exc)
+            ctx.logger.error(
+                "Send failed to %s: %s",
+                name, exc
+            )
 
 def calendar_link(title,slot,where):
     start=datetime.fromisoformat(slot)
@@ -63,7 +59,7 @@ def calendar_link(title,slot,where):
 async def finalize(ctx,plan):
     if plan.finalizing:return
     plan.finalizing=True
-    missing=[name for name in ADDR if name not in plan.replies]
+    missing = plan.missing_agents()
     if missing:
         plans.pop(plan.id,None)
         await say(ctx,plan.user,'INCOMPLETE — no group decision made. Missing agents: '+', '.join(missing)+'. Their deal breakers are unknown; no restaurant selected and no calendar link generated. Restart the missing agents and send plan again.')
@@ -136,7 +132,11 @@ async def on_chat(ctx:Context,sender:str,msg:ChatMessage):
     if any(p.user==sender for p in plans.values()):
         await say(ctx,sender,'Your existing request is still running; please do not duplicate it.')
         return
-    plan=Plan(sender)
+    plan = Plan(
+    user=sender,
+    participants=ADDR.copy(),
+    coordinator=agent.address,
+    )
     plans[plan.id]=plan
     await say(ctx,sender,f'Checking {len(ADDR)} personal agents for plan {plan.id}. Every agent must reply before any result is proposed.')
     await broadcast(ctx,plan)
@@ -159,7 +159,7 @@ async def on_reply(ctx:Context,sender:str,msg:ScoreReply):
 @agent.on_interval(period=1.0)
 async def sweep(ctx:Context):
     for plan in list(plans.values()):
-        if not plan.finalizing and time.monotonic()-plan.t0>=TIMEOUT:
+        if not plan.finalizing and plan.expired(TIMEOUT):
             await finalize(ctx,plan)
 
 agent.include(chat,publish_manifest=True)

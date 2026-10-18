@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 FIELDS = {"max_price", "max_distance_min", "dietary", "free_slots", "weights", "cuisine_pref",
-          "never_cuisines", "comfort_price", "comfort_distance_min", "preferred_slots"}
+          "never_cuisines", "comfort_price", "comfort_distance_min", "preferred_slots", "busy_days"}
 ALLOWED_WEIGHT_KEYS = {"cuisine", "rating", "distance", "price"}
 OPTIONAL_WEIGHT_KEYS = {"time"}
 SOFT_FIELDS = ("comfort_price", "comfort_distance_min", "preferred_slots")
@@ -36,6 +36,13 @@ def validate_update(original, changes):
             for x in val:
                 datetime.fromisoformat(x)
             hard[key] = val
+        elif key == "busy_days":
+            from datetime import date
+            if not isinstance(val, list) or any(not isinstance(x, str) for x in val):
+                raise ValueError("busy_days must be a list of ISO dates")
+            for x in val:
+                date.fromisoformat(x)
+            hard[key] = sorted(set(val))
         elif key == "preferred_slots":
             from datetime import datetime
             if not isinstance(val, list) or any(not isinstance(x,str) for x in val):

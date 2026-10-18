@@ -107,7 +107,11 @@ def minimal_relaxation(persona, c) -> Optional[dict]:
         if k.category in NON_NEGOTIABLE:
             return None
         if k.name == 'free_slots':
-            changes['free_slots'] = persona['hard']['free_slots'] + [c.slot]
+            h = persona['hard']
+            if c.slot[:10] in h.get('busy_days', []):
+                changes['busy_days'] = [d for d in h['busy_days'] if d != c.slot[:10]]
+            if 'free_slots' in h and c.slot not in h['free_slots']:
+                changes['free_slots'] = h['free_slots'] + [c.slot]
         elif k.name == 'max_price':
             changes['max_price'] = c.price
         elif k.name == 'max_distance_min':
@@ -131,8 +135,10 @@ def describe_relaxation(persona, changes) -> str:
         parts.append(f"+${changes['max_price'] - h['max_price']:g} budget (to ${changes['max_price']:g})")
     if 'max_distance_min' in changes:
         parts.append(f"+{changes['max_distance_min'] - h['max_distance_min']:g} min travel (to {changes['max_distance_min']:g} min)")
-    for slot in changes.get('free_slots', [])[len(h['free_slots']):]:
+    for slot in changes.get('free_slots', [])[len(h.get('free_slots', [])):]:
         parts.append(f'add {when(slot)} to your free times')
+    for day in sorted(set(h.get('busy_days', [])) - set(changes.get('busy_days', h.get('busy_days', [])))):
+        parts.append(f'free up {day}')
     if 'never_cuisines' in changes:
         parts += [f'allow {x}' for x in h.get('never_cuisines', []) if x not in changes['never_cuisines']]
     return '; '.join(parts) or 'no change needed'
