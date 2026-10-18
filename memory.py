@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     space_id text NOT NULL,
     agent_id text NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS sessions (
+    key text PRIMARY KEY,
+    data jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS plans (
     id text PRIMARY KEY,
     group_id text NOT NULL REFERENCES groups ON DELETE CASCADE,
@@ -136,6 +140,25 @@ def latest_plan(conn, group_id):
     row = conn.execute("SELECT id, candidate_id, metrics FROM plans WHERE group_id = %s AND status = 'proposed' "
                        'ORDER BY created_at DESC LIMIT 1', (group_id,)).fetchone()
     return dict(zip(('id', 'candidate_id', 'metrics'), row)) if row else None
+
+
+def save_session(conn, key, data):
+    """The latest planning session for a group (or a solo member): invites, answers, the plan."""
+    with conn.transaction():
+        conn.execute('INSERT INTO sessions (key, data) VALUES (%s, %s) ON CONFLICT (key) '
+                     'DO UPDATE SET data = EXCLUDED.data, updated_at = now()', (key, Jsonb(data)))
+
+
+def get_session(conn, key):
+    row = conn.execute('SELECT data FROM sessions WHERE key = %s', (key,)).fetchone()
+    return row[0] if row else None
+
+
+def invited_session(conn, member_id):
+    """The newest session still waiting for this member's IN/OUT."""
+    row = conn.execute("SELECT data FROM sessions WHERE data->'answers'->>%s = 'asked' ORDER BY updated_at DESC LIMIT 1",
+                       (member_id,)).fetchone()
+    return row[0] if row else None
 
 
 def group_members(conn, group_id):

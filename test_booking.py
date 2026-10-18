@@ -61,6 +61,21 @@ class BookingTests(unittest.TestCase):
         self.assertEqual(message(b), "Water Grill doesn't take reservations: just walk in.")
         self.assertIn('no_reservations', booking.RESULT_SCHEMA)
 
+    def test_showtime_check_never_buys_and_keeps_date_in_link(self):
+        api = FakeAPI(['finished'], {'outcome': 'available', 'bookable_times': ['7:45 PM', '8:30 PM'], 'platform': 'other',
+                                     'restaurant_page_url': 'https://www.amctheatres.com/movie-theatres/x?date=2026-10-24'})
+        b = check_availability('AMC Westwood', SLOT, 3, request=api, sleep=lambda s: None, what='to watch Primetime')
+        task = api.calls[0][2]['task']
+        self.assertIn('"Primetime"', task)
+        self.assertIn('NEVER buy tickets', task)
+        self.assertTrue(api.calls[0][2]['startUrl'].startswith('https://www.google.com/search?'))
+        self.assertEqual(b.link, 'https://www.amctheatres.com/movie-theatres/x?date=2026-10-24')
+        self.assertIn('Showtimes to watch Primetime at AMC Westwood', message(b))
+        self.assertIn('7:45 PM, 8:30 PM', message(b))
+        seat = FakeAPI(['finished'], {'outcome': 'available', 'restaurant_page_url': 'https://www.fandango.com/checkout/seat'})
+        b = check_availability('AMC Westwood', SLOT, 3, request=seat, sleep=lambda s: None, what='a movie')
+        self.assertTrue(b.link.startswith('https://www.google.com/search?'))  # seat/checkout pages never forwarded
+
     def test_every_failure_falls_back_to_a_link(self):
         cases = {
             'network': FakeAPI(['finished'], create_error=urllib.error.URLError('down')),

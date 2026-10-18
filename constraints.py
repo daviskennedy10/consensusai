@@ -22,13 +22,16 @@ class Constraint:
 # Non-negotiable checks first: only the first veto reason leaves the agent, and a
 # negotiable reason must not hide one that no counteroffer could fix.
 HARD = (
-    Constraint('dietary', 'hard', 'dietary', lambda p, c: all(d in c.tags for d in p['hard']['dietary']), 'dietary requirement unavailable'),
+    # Food rules only bind food venues (a cinema has no menu to be halal or vegetarian).
+    Constraint('dietary', 'hard', 'dietary', lambda p, c: not getattr(c, 'food', True) or all(d in c.tags for d in p['hard']['dietary']),
+               'dietary requirement unavailable'),
     # Demo personas list free_slots; real users are free unless they named busy_days.
     Constraint('free_slots', 'hard', 'availability', lambda p, c: ('free_slots' not in p['hard'] or c.slot in p['hard']['free_slots'])
                and c.slot[:10] not in p['hard'].get('busy_days', []), 'not free at that time'),
     Constraint('max_price', 'hard', 'budget', lambda p, c: c.price <= p['hard']['max_price'], 'over budget'),
     Constraint('max_distance_min', 'hard', 'distance', lambda p, c: c.distance_min <= p['hard']['max_distance_min'], 'too far'),
-    Constraint('never_cuisines', 'hard', 'cuisine', lambda p, c: c.cuisine.lower() not in p['hard'].get('never_cuisines', []), 'cuisine is a deal breaker'),
+    Constraint('never_cuisines', 'hard', 'cuisine', lambda p, c: not getattr(c, 'food', True)
+               or c.cuisine.lower() not in p['hard'].get('never_cuisines', []), 'cuisine is a deal breaker'),
 )
 
 SOFT = (

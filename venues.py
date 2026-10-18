@@ -68,26 +68,33 @@ def cuisine(place):
     return t.removesuffix('_restaurant').replace('_', ' ') if t != 'restaurant' else 'restaurant'
 
 
-def to_candidate(place, slot, center, halal=False):
+TICKET_ESTIMATE = 18  # shortcut: theaters rarely have a Places price tier; real prices come from the showtime check
+
+
+def to_candidate(place, slot, center, halal=False, food=True):
     tags = ['vegetarian'] if place.get('servesVegetarianFood') else []
     tags += ['halal'] if halal else []
     return SimpleNamespace(
-        id=f"{place['id']}@{slot}", name=place['displayName']['text'], cuisine=cuisine(place),
-        price=PRICE_PER_PERSON.get(place.get('priceLevel'), 30), rating=float(place.get('rating') or 0),
+        id=f"{place['id']}@{slot}", name=place['displayName']['text'], cuisine=cuisine(place), food=food,
+        price=PRICE_PER_PERSON.get(place.get('priceLevel'), 30 if food else TICKET_ESTIMATE), rating=float(place.get('rating') or 0),
         distance_min=max(1, round(km(center, place['location']) / CITY_KMH * 60)) if center and place.get('location') else 15,
         tags=tags, slot=slot, address=place.get('formattedAddress', ''), maps_url=place.get('googleMapsUri', ''),
         reservable=place.get('reservable'))  # None = Google doesn't say
 
 
-def search(area, slot, request=http, limit=15):
-    """Verified candidates near `area` for `slot` (ISO local time), plus what was dropped and why."""
+def search(area, slot, request=http, limit=15, kind='restaurants'):
+    """Verified candidates near `area` for `slot` (ISO local time), plus what was dropped and why.
+    kind: 'restaurants' or 'movie theaters' (non-food venues skip dietary checks)."""
     dt = datetime.fromisoformat(slot)
+    food = kind == 'restaurants'
     center = (request({'textQuery': area, 'maxResultCount': 1}, 'places.location').get('places') or [{}])[0].get('location')
-    places = request({'textQuery': f'restaurants in {area}', 'maxResultCount': limit}, FIELDS).get('places', [])
-    # shortcut: Google's halal search is listing evidence, not certification; add a menu check for production.
-    halal = request({'textQuery': f'halal restaurants in {area}', 'maxResultCount': limit}, FIELDS).get('places', [])
-    halal_ids = {p['id'] for p in halal}
-    places += [p for p in halal if p['id'] not in {q['id'] for q in places}]
+    places = request({'textQuery': f'{kind} in {area}', 'maxResultCount': limit}, FIELDS).get('places', [])
+    halal_ids = set()
+    if food:
+        # shortcut: Google's halal search is listing evidence, not certification; add a menu check for production.
+        halal = request({'textQuery': f'halal restaurants in {area}', 'maxResultCount': limit}, FIELDS).get('places', [])
+        halal_ids = {p['id'] for p in halal}
+        places += [p for p in halal if p['id'] not in {q['id'] for q in places}]
     kept, dropped = [], []
     for p in places:
         name = p.get('displayName', {}).get('text', '?')
@@ -96,5 +103,5 @@ def search(area, slot, request=http, limit=15):
         elif not open_at(p.get('regularOpeningHours'), dt):
             dropped.append((name, 'closed at that time'))
         else:
-            kept.append(to_candidate(p, slot, center, p['id'] in halal_ids))
+            kept.append(to_candidate(p, slot, center, p['id'] in halal_ids, food))
     return kept, dropped
