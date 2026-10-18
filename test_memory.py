@@ -1,8 +1,10 @@
 """Opt-in: runs against TEST_DATABASE_URL inside a throwaway schema (dropped after), else skipped.
 Tiger: TEST_DATABASE_URL="$DATABASE_URL" python -m unittest test_memory"""
+import json
 import os
 import unittest
 import uuid
+from pathlib import Path
 
 try:
     import psycopg
@@ -107,7 +109,8 @@ class MemoryTests(unittest.TestCase):
 
     def test_seed_demo(self):
         memory.seed_demo(self.conn)
-        self.assertEqual(memory.group_members(self.conn, 'demo'), ['jordan', 'maya', 'sam'])
+        personas = json.loads((Path(__file__).resolve().parent / 'personas.json').read_text())
+        self.assertEqual(memory.group_members(self.conn, 'demo'), sorted(personas))
         self.assertEqual(memory.group_consensus(self.conn, 'demo')[0][0], 'fusion')
 
 
