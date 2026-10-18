@@ -116,7 +116,8 @@ def remember_persona(p):
 
 def load_from_tiger():
     import memory
-    tiger(lambda conn: (memory.init(conn), memory.seed_demo(conn, BASE)))
+    # Seed only once: four agents starting together would otherwise collide on the same rows.
+    tiger(lambda conn: (memory.init(conn), memory.group_exists(conn, GROUP_ID) or memory.seed_demo(conn, BASE)))
     return tiger(memory.get_persona, name)
 
 
