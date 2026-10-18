@@ -72,6 +72,20 @@ python memory.py seed-demo                          # load the fictional demo gr
 TEST_DATABASE_URL="$DATABASE_URL" python -m unittest test_memory   # opt-in; uses a throwaway schema
 ```
 
+### Natural-language preferences (StepFun `step-5-preview`)
+
+`nl_preferences.propose(text, persona)` turns a chat message such as *"I'm vegetarian now, can't do Saturday, ideally under $20"* into the same structured update that `set ...` produces. The owner still has to `confirm` it.
+
+- **Least data to the model:** StepFun sees only the sentence plus the public slots and cuisines, never the stored profile. It returns a delta that is applied locally.
+- **Never trusted:** every field is re-checked by `validate_update`. Unknown slots and fields are rejected one by one, and the result is only a proposal.
+- **Recovery:** `set ...` commands skip the model. A network error, timeout or bad JSON returns a clear message instead of crashing.
+
+```bash
+set -a; . ./.env; set +a        # STEPFUN_API_KEY (international platform: api.stepfun.ai)
+python nl_preferences.py sam "I'd rather go Sunday, and I don't want to travel more than 20 min"
+STEPFUN_LIVE_TEST=1 python -m unittest test_nl_preferences   # opt-in live call
+```
+
 ### Why fairness beats averaging
 
 `python bench_fairness.py` simulates random groups through the real `evaluate` → `build_complete_table` → `decide` path. "Worst-off better off" means the fair pick strictly raised the least-satisfied person's score compared with picking the highest average.
