@@ -30,6 +30,7 @@ DEFAULT_PERSONA = {'hard': {'max_price': 60, 'max_distance_min': 30, 'dietary': 
                    'cuisine_pref': {}, 'weights': {'cuisine': 1, 'rating': 1, 'distance': 1, 'price': 1}}
 DEFAULT_AREA = 'Westwood, Los Angeles'
 BOOK_TRIES = 2  # top pick + runner-up; each check takes 1-3 minutes
+OPTIONS_KEPT = 5  # ranked venues kept per plan, so walk-in places can be skipped
 CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # no 0/O/1/I
 DAYS = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
 HELP = ("ConsensusAI plans group outings fairly, and keeps your deal breakers private.\n"
@@ -231,9 +232,11 @@ class Service:
         if group:
             self.store.record_plan(f'{group}-{self.rng.randrange(16**6):06x}', group, d)
         self.plans[group or member] = {'venue': c.name, 'slot': slot, 'size': len(members), 'area': area,
-                                       'options': [by_id[cid].name for cid in d.ranking[:BOOK_TRIES]]}
+                                       'options': [(by_id[cid].name, getattr(by_id[cid], 'reservable', None))
+                                                   for cid in d.ranking[:OPTIONS_KEPT]]}
         who = f'the {len(members)} of you' if len(members) > 1 else 'you'
-        base = (f"Plan for {who}: {c.name} ({c.cuisine}, {c.rating:.1f} stars, about ${c.price} per person), "
+        res = {True: ', takes reservations', False: ', walk-in only'}.get(getattr(c, 'reservable', None), '')
+        base = (f"Plan for {who}: {c.name} ({c.cuisine}, {c.rating:.1f} stars, about ${c.price} per person{res}), "
                 f"{when(slot)} near {area.split(',')[0]}.\n{d.explanation}\n"
                 f"Verified open on Google just now ({len(dropped)} closed or unverified places skipped).")
         tail = ('\nReply BOOK to check a real table, or BUSY if you cannot make it.' if group
@@ -268,16 +271,28 @@ class Service:
             yield contact, 'No plan yet. Text PLAN dinner sat 7pm near Westwood first.'
             return
         city = p['area'].split(',')[-1].strip() or 'Los Angeles'
-        options = p.get('options') or [p['venue']]
-        yield contact, f"Checking OpenTable for a table for {p['size']} at {options[0]}, {when(p['slot'])}... (usually 1-3 minutes)"
+        options = p.get('options') or [(p['venue'], None)]
+        top, top_res = options[0]
+        # Google says walk-in only: nothing to reserve, so never spend a check on it.
+        bookable = [name for name, res in options if res is not False][:BOOK_TRIES]
+        if top_res is False:
+            walk = f"{top} doesn't take reservations: just walk in, it's verified open {when(p['slot'])}."
+            if not bookable:
+                yield from self.to_all(members, walk, contact, member)
+                return
+            yield contact, f'{walk} Checking the next option that takes reservations, {bookable[0]}... (usually 1-3 minutes)'
+        else:
+            yield contact, f"Checking OpenTable for a table for {p['size']} at {top}, {when(p['slot'])}... (usually 1-3 minutes)"
         misses = []
-        for i, venue in enumerate(options):  # fair order: top pick, then the runner-up
+        for i, venue in enumerate(bookable):  # fair order among venues that take reservations
             b = self.check_table(venue, p['slot'], p['size'], city=city)
-            if b.status == 'ready' or i == len(options) - 1:
+            if b.status == 'ready' or i == len(bookable) - 1:
                 break
             misses.append(venue)
-            yield contact, f'No table found at {venue}. Checking the runner-up, {options[i + 1]}...'
+            yield contact, f'No table found at {venue}. Checking the runner-up, {bookable[i + 1]}...'
         note = f"No table at {', '.join(misses)}. " if misses and b.status == 'ready' else ''
+        if top_res is False:
+            note = f'{top} is walk-in only. ' + note
         yield from self.to_all(members, note + booking.message(b), contact, member)
 
     def busy(self, member, contact):

@@ -18,7 +18,7 @@ from types import SimpleNamespace
 SEARCH_URL = 'https://places.googleapis.com/v1/places:searchText'
 FIELDS = ('places.id,places.displayName,places.primaryType,places.types,places.rating,places.userRatingCount,'
           'places.priceLevel,places.businessStatus,places.regularOpeningHours,places.servesVegetarianFood,'
-          'places.location,places.formattedAddress,places.googleMapsUri')
+          'places.location,places.formattedAddress,places.googleMapsUri,places.reservable')
 PRICE_PER_PERSON = {'PRICE_LEVEL_FREE': 0, 'PRICE_LEVEL_INEXPENSIVE': 15, 'PRICE_LEVEL_MODERATE': 30,
                     'PRICE_LEVEL_EXPENSIVE': 55, 'PRICE_LEVEL_VERY_EXPENSIVE': 90}
 CITY_KMH = 20  # LA driving incl. parking; turns straight-line km into minutes
@@ -73,7 +73,8 @@ def to_candidate(place, slot, center):
         id=f"{place['id']}@{slot}", name=place['displayName']['text'], cuisine=cuisine(place),
         price=PRICE_PER_PERSON.get(place.get('priceLevel'), 30), rating=float(place.get('rating') or 0),
         distance_min=max(1, round(km(center, place['location']) / CITY_KMH * 60)) if center and place.get('location') else 15,
-        tags=tags, slot=slot, address=place.get('formattedAddress', ''), maps_url=place.get('googleMapsUri', ''))
+        tags=tags, slot=slot, address=place.get('formattedAddress', ''), maps_url=place.get('googleMapsUri', ''),
+        reservable=place.get('reservable'))  # None = Google doesn't say
 
 
 def search(area, slot, request=http, limit=15):

@@ -57,6 +57,9 @@ class SearchTests(unittest.TestCase):
         self.assertGreater(far.distance_min, 25)
         self.assertEqual(far.tags, ['vegetarian'])
         self.assertNotIn('halal', near.tags + far.tags)  # never assumed
+        self.assertIsNone(near.reservable)
+        kept, _ = search('Westwood', SAT_7PM, self.fake([place('walkin', reservable=False)]))
+        self.assertIs(kept[0].reservable, False)
 
     def test_missing_key(self):
         old = os.environ.pop('GOOGLE_PLACES_API_KEY', None)

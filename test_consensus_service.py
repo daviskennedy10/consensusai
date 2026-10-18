@@ -31,9 +31,9 @@ class FakeStore:
     def record_plan(self, pid, g, d): self.plans.append((pid, g, d.chosen))
 
 
-def venue(vid, price=25, tags=('vegetarian',), rating=4.5, cuisine='thai'):
+def venue(vid, price=25, tags=('vegetarian',), rating=4.5, cuisine='thai', reservable=None):
     return SimpleNamespace(id=f'{vid}@{SAT}', name=vid.title(), cuisine=cuisine, price=price, rating=rating,
-                           distance_min=10, tags=list(tags), slot=SAT)
+                           distance_min=10, tags=list(tags), slot=SAT, reservable=reservable)
 
 
 class Harness:
@@ -136,6 +136,29 @@ class ServiceTests(unittest.TestCase):
         out = h.say('+1A', 'book')
         self.assertEqual(len(tried), 2)
         self.assertIn('has no table', out[-1][1])
+
+    def test_walk_in_top_pick_is_never_checked(self):
+        tried = []
+        places = lambda a, s: ([venue('walkin', rating=4.9, reservable=False), venue('bistro', reservable=True),
+                                venue('cafe', reservable=False)], [])
+        h = Harness(places=places, table=lambda v, s, n, city: tried.append(v) or booking.Booking('ready', v, s, n, 'https://x', ()))
+        h.say('+1A', 'hi')
+        self.assertIn('walk-in only', h.say('+1A', 'plan dinner sat 7pm')[0][1])
+        out = h.say('+1A', 'book')
+        self.assertEqual(tried, ['Bistro'])
+        self.assertIn("Walkin doesn't take reservations", out[0][1])
+        self.assertTrue(out[-1][1].startswith('Walkin is walk-in only. A table for 1 at Bistro'))
+
+    def test_all_walk_in_means_no_checks(self):
+        tried = []
+        h = Harness(places=lambda a, s: ([venue('walkin', reservable=False)], []),
+                    table=lambda v, s, n, city: tried.append(v))
+        h.say('+1A', 'hi')
+        h.say('+1A', 'plan dinner sat 7pm')
+        out = h.say('+1A', 'book')
+        self.assertEqual(tried, [])
+        self.assertEqual(len(out), 1)
+        self.assertIn('just walk in', out[0][1])
 
     def test_places_failure_never_invents_a_venue(self):
         def down(area, slot):
