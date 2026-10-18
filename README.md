@@ -24,9 +24,13 @@ Alex (the 4th participant) and peer-coordinated planning are on `feature/agent-c
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env      # first-time setup; fill in your keys/settings in .env
+set -a; . ./.env; set +a  # load the edited file in each terminal before running agents
 python -m unittest -v      # all tests, stdlib only, ~3 s
 python bench_fairness.py   # fairness vs averaging benchmark
 ```
+
+The scripts read environment variables and do not automatically load `.env`. The template labels each integration and includes optional test settings. Only fill in the integrations you use; `.env` is gitignored.
 
 Use **separate private, random seeds** for any real deployment. `personas.json` contains public demo seeds; they're not private or secure identities. Never put real private user information or payment credentials in this demo configuration.
 
@@ -81,7 +85,7 @@ It does three things:
 - **Consent:** it stores only what members chose to share, never deal breakers, and `forget_member()` deletes everything about a person.
 
 ```bash
-echo 'DATABASE_URL=postgres://...' > .env           # Tiger connection string; .env is gitignored
+# Set DATABASE_URL to your Tiger connection string in .env.
 set -a; . ./.env; set +a
 python memory.py init                               # create tables (idempotent)
 python memory.py seed-demo                          # load the fictional demo group
