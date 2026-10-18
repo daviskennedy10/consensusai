@@ -86,6 +86,18 @@ python nl_preferences.py sam "I'd rather go Sunday, and I don't want to travel m
 STEPFUN_LIVE_TEST=1 python -m unittest test_nl_preferences   # opt-in live call
 ```
 
+### Booking check (Browser Use)
+
+After the group approves, `booking.check_availability(venue, slot, party_size)` sends a Browser Use cloud agent to check real availability. It stops at the page where a human enters their details, and **never books**. Live booking needs real approval and contact details, so it isn't built yet.
+
+- **Bounded:** at most 25 browser steps. A real check of Water Grill (LA) for 3 people on Oct 24 at 7pm took 2 steps, 21 s and $0.012, and returned the live 6:30–7:30 PM slots.
+- **Never fails silently:** a missing key, network error, blocked site, failed task or timeout returns an OpenTable deep link to finish by hand. `message(b)` gives a chat-ready line.
+
+```bash
+set -a; . ./.env; set +a        # BROWSER_USE_API_KEY
+python booking.py "Water Grill" 2026-10-24T19:00 3
+```
+
 ### Why fairness beats averaging
 
 `python bench_fairness.py` simulates random groups through the real `evaluate` → `build_complete_table` → `decide` path. "Worst-off better off" means the fair pick strictly raised the least-satisfied person's score compared with picking the highest average.
