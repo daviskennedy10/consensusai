@@ -71,7 +71,7 @@ def cuisine(place):
 TICKET_ESTIMATE = 18  # shortcut: theaters rarely have a Places price tier; real prices come from the showtime check
 
 
-def to_candidate(place, slot, center, halal=False, food=True):
+def to_candidate(place, slot, center, food=True, halal=False):
     tags = ['vegetarian'] if place.get('servesVegetarianFood') else []
     tags += ['halal'] if halal else []
     return SimpleNamespace(
@@ -103,5 +103,5 @@ def search(area, slot, request=http, limit=15, kind='restaurants'):
         elif not open_at(p.get('regularOpeningHours'), dt):
             dropped.append((name, 'closed at that time'))
         else:
-            kept.append(to_candidate(p, slot, center, p['id'] in halal_ids, food))
+            kept.append(to_candidate(p, slot, center, food, p['id'] in halal_ids))
     return kept, dropped
