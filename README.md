@@ -1,6 +1,22 @@
 # ConsensusAI prototype (hackathon)
 
+![tag:innovationlab](https://img.shields.io/badge/innovationlab-3D8BD3)
+![tag:hackathon](https://img.shields.io/badge/hackathon-5F43F1)
+
 An ASI:One-chat-accessible organizer communicates with three independently configured personal agents. Each personal agent privately enforces deal breakers and returns only scores/vetoes. The organizer selects a maximin-fair feasible dinner proposal after **all agents** respond.
+
+## Agents
+
+Every agent is a Fetch.ai uAgent registered on Agentverse (mailbox) and reachable through ASI:One with the Agent Chat Protocol. Each one privately scores candidate plans for its owner, and any of them can coordinate a group plan.
+
+| Agent | Name | Address |
+|---|---|---|
+| Alex | `consensusai-alex` | [`agent1qf9u9z48ntupawq9vmewexygv70tmk7mtj6ejtlpur6n24gzgzajz95g4fv`](https://agentverse.ai/agents/details/agent1qf9u9z48ntupawq9vmewexygv70tmk7mtj6ejtlpur6n24gzgzajz95g4fv/profile) |
+| Maya | `consensusai-maya` | [`agent1qtk2djdjqmpa7geutqgkdyy6lpshatl2m2d7m65ntndt7zfp3496ur9sn8x`](https://agentverse.ai/agents/details/agent1qtk2djdjqmpa7geutqgkdyy6lpshatl2m2d7m65ntndt7zfp3496ur9sn8x/profile) |
+| Sam | `consensusai-sam` | [`agent1q0tsfuy8kpr5pp7mqa944jjlr648f9hn092khw4fpvxcalpq9l7pws8cxvw`](https://agentverse.ai/agents/details/agent1q0tsfuy8kpr5pp7mqa944jjlr648f9hn092khw4fpvxcalpq9l7pws8cxvw/profile) |
+| Jordan | `consensusai-jordan` | [`agent1qvkmuvs7dnyy4gxymrfkz2htcfqkrzjsj0trtj2whq8savq8knxrj879t9q`](https://agentverse.ai/agents/details/agent1qvkmuvs7dnyy4gxymrfkz2htcfqkrzjsj0trtj2whq8savq8knxrj879t9q/profile) |
+
+Alex (the 4th participant) and peer-coordinated planning are on `feature/agent-coordination` until that branch merges.
 
 ## Setup
 
