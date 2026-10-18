@@ -1,4 +1,7 @@
-"""Run: python personal_agent.py maya. Configure through its ASI:One chat."""
+"""Run: python personal_agent.py maya. Configure through its ASI:One chat.
+Live venues and plain-text preferences need GOOGLE_PLACES_API_KEY and STEP_API_KEY
+in the environment (set -a; . ./.env; set +a); without them it uses venues.json and `set`."""
+import asyncio
 import re
 import time
 import urllib.parse
@@ -26,7 +29,9 @@ from models import (
     CounterofferRequest,
     CounterofferReply,
 )
-from preferences import load_persona, parse_update, save_persona, validate_update
+import nl_preferences
+import venues as places
+from preferences import load_persona, save_persona, validate_update
 from scoring import evaluate
 
 from negotiation import (
@@ -70,6 +75,11 @@ negotiations = {}
 
 # Give humans three minutes to respond during the demo.
 NEGOTIATION_TIMEOUT = 180
+
+# Live venues come from Google Places near this area.
+PLAN_AREA = os.getenv("PLAN_AREA", "Westwood, Los Angeles")
+# Google Maps links for live candidates, by candidate id.
+maps_links = {}
 if len(sys.argv) != 2 or sys.argv[1] not in json.loads((BASE/'personas.json').read_text()):
     raise SystemExit('Usage: python personal_agent.py maya|jordan|sam|alex')
 name = sys.argv[1]
@@ -162,8 +172,68 @@ def calendar_link(title, slot, location):
     return "https://calendar.google.com/calendar/render?" + params
 
 
+async def find_live_candidates(ctx):
+    """Google Places venues verified open at every slot -> (candidates, note for the user).
+    candidates is None when the plan should use venues.json instead."""
+    if os.getenv("NEGOTIATION_DEMO") == "1" or not os.getenv("GOOGLE_PLACES_API_KEY"):
+        return None, None
+
+    try:
+        results = await asyncio.gather(*(
+            asyncio.to_thread(places.search, PLAN_AREA, slot)
+            for slot in SLOTS[2]
+        ))
+    except Exception as exc:
+        # Places down or out of quota: never invent venues; fall back and say so.
+        ctx.logger.warning("Google Places search failed: %r", exc)
+        return None, (
+            f"Live restaurant search failed ({type(exc).__name__}), "
+            "so this plan uses the demo restaurant list."
+        )
+
+    found = [c for kept, _ in results for c in kept]
+
+    if not found:
+        return None, (
+            f"No restaurants near {PLAN_AREA} are verified open at the "
+            "planned times, so this plan uses the demo restaurant list."
+        )
+
+    for c in found:
+        maps_links[c.id] = c.maps_url
+
+    candidates = [
+        Candidate(
+            id=c.id,
+            name=c.name,
+            cuisine=c.cuisine,
+            price=c.price,
+            distance_min=c.distance_min,
+            rating=c.rating,
+            tags=c.tags,
+            slot=c.slot,
+        )
+        for c in found
+    ]
+
+    return candidates, (
+        f"Found {len({c.name for c in found})} restaurants near "
+        f"{PLAN_AREA.split(',')[0]} on Google, each verified open "
+        "at the planned time."
+    )
+
+
+def round_candidates(plan):
+    # Live plans search every slot once up front; each round takes its slots from that pool,
+    # so the re-check after an approved counteroffer scores the exact same venues.
+    if plan.live is None:
+        return get_candidates(plan.round)
+
+    return [c for c in plan.live if c.slot in SLOTS[plan.round]]
+
+
 async def begin_round(ctx, plan):
-    plan.begin_round(get_candidates(plan.round))
+    plan.begin_round(round_candidates(plan))
 
     request = plan.make_request()
 
@@ -454,12 +524,9 @@ async def finalize_peer_plan(ctx, plan):
     # option leaves someone significantly unhappy.
     compromise = propose_compromise(table)
 
-    venue_id, slot = fair.split("@", 1)
-
-    venue = next(
-        v for v in venues
-        if v["id"] == venue_id
-    )
+    # Look the venue up in this plan's candidates: live ones are not in venues.json.
+    chosen = next(c for c in plan.candidates if c.id == fair)
+    slot = chosen.slot
 
     scores = table[fair]
 
@@ -475,10 +542,10 @@ async def finalize_peer_plan(ctx, plan):
     lines = [
         f"PROPOSED GROUP PLAN (coordinated by {name})",
         f"Plan ID: {plan.id}",
-        f"Restaurant: {venue['name']}",
-        f"Cuisine: {venue['cuisine']}",
+        f"Restaurant: {chosen.name}",
+        f"Cuisine: {chosen.cuisine}",
         f"Time: {slot}",
-        f"Price: approximately ${venue['price']} per person",
+        f"Price: approximately ${chosen.price} per person",
         "",
         f"Minimum satisfaction: {lowest_person} = "
         f"{scores[lowest_person]:.2f}",
@@ -518,12 +585,14 @@ async def finalize_peer_plan(ctx, plan):
     # CASE 6: Generate calendar draft.
     # --------------------------------------------------
     lines.append("")
+    if maps_links.get(fair):
+        lines.append("Verified open on Google Maps: " + maps_links[fair])
     lines.append(
         "Calendar draft: "
         + calendar_link(
-            f"Dinner at {venue['name']}",
+            f"Dinner at {chosen.name}",
             slot,
-            venue["name"],
+            chosen.name,
         )
     )
 
@@ -572,19 +641,22 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
 
     lower_text = text.lower()
 
+    # This is NOT real authentication. For a public demo, configure a private allowlist.
+    allowed = [x.strip() for x in os.getenv(f'{name.upper()}_OWNER_ADDRESSES','').split(',') if x.strip()]
+
+    # Other free text from the owner is a plain-language preference (StepFun, below).
     if (
         lower_text not in valid_commands
         and not lower_text.startswith("set ")
         and not lower_text.startswith("approve ")
         and not lower_text.startswith("reject ")
+        and sender not in allowed
     ):
         ctx.logger.info(
             "Ignoring unrecognized message: %.100r",
             text,
         )
         return
-    # This is NOT real authentication. For a public demo, configure a private allowlist.
-    allowed = [x.strip() for x in os.getenv(f'{name.upper()}_OWNER_ADDRESSES','').split(',') if x.strip()]
     if not allowed or sender not in allowed:
         await reply(ctx, sender, 'Preference edits disabled. Set '+name.upper()+'_OWNER_ADDRESSES to the allowed ASI:One sender address. Ask the agent operator to configure it.')
         return
@@ -745,26 +817,31 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             )
             return
 
+        # Search before the plan exists, so the search can't eat into the scoring timeout.
+        live, note = await find_live_candidates(ctx)
+
         plan = Plan(
             user=sender,
             participants=ADDR.copy(),
             coordinator=agent.address,
         )
         plan.session = ctx.session  # the user's ASI:One chat; see use_plan_session()
+        plan.live = live
 
         plans[plan.id] = plan
 
         await reply(
             ctx,
             sender,
-            f"{name.title()} is coordinating plan {plan.id}. "
+            (note + "\n" if note else "")
+            + f"{name.title()} is coordinating plan {plan.id}. "
             f"All {len(ADDR)} personal agents will participate.",
         )
 
         await begin_round(ctx, plan)
         return
     if text.lower() in ('help', 'start'):
-        await reply(ctx, sender, 'Commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied.')
+        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied.')
     elif text.lower() == 'show':
         await reply(ctx, sender, json.dumps({'hard':persona['hard'],'weights':persona['weights'],'cuisine_pref':persona['cuisine_pref']}, indent=2))
     elif text.lower() == 'confirm':
@@ -784,13 +861,15 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         ctx.storage.set(f'pending_{sender}','')
         await reply(ctx,sender,'Pending preference update cancelled.')
     else:
-        try:
-            update=parse_update(text)
-            validate_update(persona,update)
-            ctx.storage.set(f'pending_{sender}',json.dumps(update))
-            await reply(ctx,sender,'Proposed change: '+json.dumps(update)+'\nReply confirm to save, or cancel.')
-        except (ValueError,TypeError,json.JSONDecodeError) as e:
-            await reply(ctx,sender,str(e)+'\nSend help for examples.')
+        # `set ...` is parsed directly; plain text goes to StepFun. Either way the result is only
+        # a proposal: validate_update checks it again and nothing saves without `confirm`.
+        proposal = await asyncio.to_thread(nl_preferences.propose, text, persona)
+        if not proposal.update:
+            problem = '; '.join(proposal.rejected[:2]) or "I didn't catch a preference there."
+            await reply(ctx, sender, problem + '\nSend help for examples.')
+            return
+        ctx.storage.set(f'pending_{sender}', json.dumps(proposal.update))
+        await reply(ctx, sender, 'Proposed change:\n' + proposal.summary + '\nReply confirm to save, or cancel.')
 
 @chat.on_message(ChatAcknowledgement)
 async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
