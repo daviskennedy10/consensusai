@@ -58,6 +58,18 @@ class CounterofferTests(unittest.TestCase):
             self.assertNotIn('$', o.question)
             self.assertFalse(any(name in o.question.lower() for name in PERSONAS))
 
+    def test_each_person_gets_at_most_one_question(self):
+        people = [o.person for o in counteroffers(self.replies, self.cands, limit=10)]
+        self.assertEqual(len(people), len(set(people)))
+
+    def test_unlocked_needs_every_blocker(self):
+        misses = [negotiation.NearMiss('x', {'a': 'budget', 'b': 'distance'}, .5),
+                  negotiation.NearMiss('y', {'a': 'availability'}, .4)]
+        self.assertIsNone(negotiation.unlocked(misses, {('a', 'x'): True}))
+        self.assertEqual(negotiation.unlocked(misses, {('a', 'x'): True, ('b', 'x'): True}), 'x')
+        self.assertIsNone(negotiation.unlocked(misses, {('a', 'y'): False}))
+        self.assertEqual(negotiation.unlocked(misses, {('a', 'y'): True}), 'y')
+
     def test_dietary_vetoes_are_never_negotiated(self):
         ids = [m.candidate_id for m in near_misses(self.replies, limit=50)]
         self.assertNotIn('thai-orchid@2026-10-23T19:00', ids)  # Sam is also unavailable, but diet is reported first
