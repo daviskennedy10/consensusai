@@ -47,6 +47,7 @@ SLOTS = {
 
 # Planning sessions coordinated by THIS personal agent.
 plans = {}
+latest_status = {}
 if len(sys.argv) != 2 or sys.argv[1] not in json.loads((BASE/'personas.json').read_text()):
     raise SystemExit('Usage: python personal_agent.py maya|jordan|sam|alex')
 name = sys.argv[1]
@@ -56,8 +57,34 @@ agent = Agent(name=f'consensusai-{name}', seed=persona['seed'], port=port, mailb
 chat = Protocol(spec=chat_protocol_spec)
 
 async def reply(ctx, target, message):
-    await ctx.send(target, ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=[TextContent(type='text',text=message)]))
+    ctx.logger.info(
+        "SENDING CHAT to=%s preview=%r",
+        target,
+        message[:150]
+    )
 
+    try:
+        result = await ctx.send(
+            target,
+            ChatMessage(
+                timestamp=datetime.now(timezone.utc),
+                msg_id=uuid4(),
+                content=[
+                    TextContent(type="text", text=message)
+                ]
+            )
+        )
+
+        ctx.logger.info(
+            "CHAT SEND RESULT: %s",
+            result
+        )
+
+    except Exception:
+        ctx.logger.exception(
+            "FAILED to send chat message to %s",
+            target
+        )
 def get_candidates(round_no):
     return [
         Candidate(
@@ -155,16 +182,29 @@ async def finalize_peer_plan(ctx, plan):
     plan.finalizing = True
 
     missing = plan.missing_agents()
+    ctx.logger.info(
+        "FINALIZING plan=%s missing=%s recipient=%s",
+        plan.id,
+        missing,
+        plan.user
+    )
 
     if missing:
         plans.pop(plan.id, None)
 
-        await reply(
-            ctx,
-            plan.user,
-            "INCOMPLETE: Missing responses from "
-            + ", ".join(missing)
-            + ". No group decision was made.",
+        message = (
+            f"INCOMPLETE: Plan {plan.id}. "
+            f"Missing responses from {', '.join(missing)}. "
+            "No group decision was made."
+        )
+
+        latest_status[plan.user] = message
+
+        await reply(ctx, plan.user, message)
+
+        ctx.logger.info(
+            "FINISHED incomplete-plan notification for %s",
+            plan.id
         )
         return
 
@@ -268,12 +308,45 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     text,
     flags=re.IGNORECASE,
     ).strip()
+    if not text:
+        return
+
+    valid_commands = {
+        "plan",
+        "plan dinner",
+        "help",
+        "start",
+        "show",
+        "confirm",
+        "cancel",
+        "status",
+    }
+
+    if (
+        text.lower() not in valid_commands
+        and not text.lower().startswith("set ")
+    ):
+        ctx.logger.info(
+            "Ignoring unrecognized message: %.100r",
+            text
+        )
+        return
     # This is NOT real authentication. For a public demo, configure a private allowlist.
     allowed = [x.strip() for x in os.getenv(f'{name.upper()}_OWNER_ADDRESSES','').split(',') if x.strip()]
     if not allowed or sender not in allowed:
         await reply(ctx, sender, 'Preference edits disabled. Set '+name.upper()+'_OWNER_ADDRESSES to the allowed ASI:One sender address. Ask the agent operator to configure it.')
         return
         # A personal agent can initiate a group planning session.
+    
+        # Allow the user to retrieve the latest planning result
+    if text.lower() == "status":
+        message = latest_status.get(
+            sender,
+            "No completed planning session found."
+        )
+
+        await reply(ctx, sender, message)
+        return
     if text.lower() in ("plan", "plan dinner"):
         if any(p.user == sender for p in plans.values()):
             await reply(
@@ -389,8 +462,12 @@ async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
 async def check_plan_timeouts(ctx: Context):
     for plan in list(plans.values()):
         if not plan.finalizing and plan.expired(TIMEOUT):
+            ctx.logger.warning(
+                "TIMEOUT plan=%s missing=%s",
+                plan.id,
+                plan.missing_agents()
+            )
             await finalize_peer_plan(ctx, plan)
-
 agent.include(chat,publish_manifest=True)
 if __name__=='__main__':
     agent.run()
