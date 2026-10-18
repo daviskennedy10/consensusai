@@ -57,6 +57,9 @@ class SearchTests(unittest.TestCase):
         self.assertGreater(far.distance_min, 25)
         self.assertEqual(far.tags, ['vegetarian'])
         self.assertNotIn('halal', near.tags + far.tags)  # never assumed
+        self.assertIsNone(near.reservable)
+        kept, _ = search('Westwood', SAT_7PM, self.fake([place('walkin', reservable=False)]))
+        self.assertIs(kept[0].reservable, False)
 
     def test_halal_only_from_googles_halal_search(self):
         kept, _ = search('Westwood', SAT_7PM, self.fake([place('both'), place('plain')], halal=[place('both'), place('kabab')]))
