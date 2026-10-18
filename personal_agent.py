@@ -62,6 +62,11 @@ SLOTS = {
 # Planning sessions coordinated by THIS personal agent.
 plans = {}
 latest_status = {}
+# Counteroffers awaiting the owner of THIS personal agent.
+pending_counteroffers = {}
+
+# Give humans three minutes to respond during the demo.
+NEGOTIATION_TIMEOUT = 180
 if len(sys.argv) != 2 or sys.argv[1] not in json.loads((BASE/'personas.json').read_text()):
     raise SystemExit('Usage: python personal_agent.py maya|jordan|sam|alex')
 name = sys.argv[1]
@@ -420,15 +425,20 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         "confirm",
         "cancel",
         "status",
+        "offer",
     }
 
+    lower_text = text.lower()
+
     if (
-        text.lower() not in valid_commands
-        and not text.lower().startswith("set ")
+        lower_text not in valid_commands
+        and not lower_text.startswith("set ")
+        and not lower_text.startswith("approve ")
+        and not lower_text.startswith("reject ")
     ):
         ctx.logger.info(
             "Ignoring unrecognized message: %.100r",
-            text
+            text,
         )
         return
     # This is NOT real authentication. For a public demo, configure a private allowlist.
@@ -439,6 +449,143 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         # A personal agent can initiate a group planning session.
     
         # Allow the user to retrieve the latest planning result
+    # -------------------------------------------------
+    # Private negotiation commands
+    # -------------------------------------------------
+
+    if lower_text == "offer":
+        active = [
+            (plan_id, offer)
+            for plan_id, offer in pending_counteroffers.items()
+            if offer["owner"] == sender
+        ]
+
+        if not active:
+            await reply(ctx, sender, "No pending counteroffers.")
+            return
+
+        lines = []
+
+        for plan_id, offer in active:
+            explanation = describe_relaxation(
+                persona,
+                offer["changes"],
+            )
+
+            lines.append(
+                f"Plan {plan_id}: "
+                f"{offer['candidate'].name}\n"
+                f"Proposed change: {explanation}\n"
+                f"APPROVE {plan_id} or REJECT {plan_id}"
+            )
+
+        await reply(ctx, sender, "\n\n".join(lines))
+        return
+
+    if lower_text.startswith(("approve ", "reject ")):
+        parts = lower_text.split()
+
+        if len(parts) != 2:
+            await reply(
+                ctx,
+                sender,
+                "Use APPROVE <plan_id> or REJECT <plan_id>.",
+            )
+            return
+
+        action, plan_id = parts
+        offer = pending_counteroffers.get(plan_id)
+
+        if not offer or offer["owner"] != sender:
+            await reply(
+                ctx,
+                sender,
+                "No matching pending counteroffer.",
+            )
+            return
+
+        if (
+            time.monotonic() - offer["created_at"]
+            >= NEGOTIATION_TIMEOUT
+        ):
+            pending_counteroffers.pop(plan_id, None)
+
+            await ctx.send(
+                offer["coordinator"],
+                CounterofferReply(
+                    plan_id=plan_id,
+                    persona=name,
+                    candidate_id=offer["candidate"].id,
+                    status="rejected",
+                ),
+            )
+
+            await reply(
+                ctx,
+                sender,
+                "This counteroffer has expired.",
+            )
+            return
+
+        if action == "reject":
+            pending_counteroffers.pop(plan_id, None)
+
+            await ctx.send(
+                offer["coordinator"],
+                CounterofferReply(
+                    plan_id=plan_id,
+                    persona=name,
+                    candidate_id=offer["candidate"].id,
+                    status="rejected",
+                ),
+            )
+
+            await reply(
+                ctx,
+                sender,
+                "Counteroffer rejected. "
+                "Your preferences were not changed.",
+            )
+            return
+
+        # Explicit human approval.
+        # Validate the update again before saving.
+        try:
+            updated = validate_update(
+                persona,
+                offer["changes"],
+            )
+
+            save_persona(name, BASE, updated)
+            persona = updated
+
+        except (ValueError, TypeError) as exc:
+            await reply(
+                ctx,
+                sender,
+                f"Could not apply counteroffer: {exc}",
+            )
+            return
+
+        pending_counteroffers.pop(plan_id, None)
+
+        await ctx.send(
+            offer["coordinator"],
+            CounterofferReply(
+                plan_id=plan_id,
+                persona=name,
+                candidate_id=offer["candidate"].id,
+                status="approved",
+            ),
+        )
+
+        await reply(
+            ctx,
+            sender,
+            f"Approved compromise for plan {plan_id}. "
+            "Your updated preferences have been saved.",
+        )
+        return
     if text.lower() == "status":
         message = latest_status.get(
             sender,
@@ -530,21 +677,28 @@ async def on_counteroffer_request(
     sender: str,
     msg: CounterofferRequest,
 ):
-    # Only known coordinating agents can request negotiations.
-    if sender not in ADDR.values():
+    # Only accept negotiation requests from known personal agents.
+    if sender not in ADDR.values() or sender == agent.address:
         ctx.logger.warning(
-            "Rejected counteroffer from unknown agent %s",
+            "Rejected unauthorized counteroffer from %s",
             sender,
         )
         return
 
-    ctx.logger.info(
-        "Received counteroffer request for plan=%s candidate=%s",
-        msg.plan_id,
-        msg.candidate.id,
-    )
+    # Avoid replacing an existing pending approval.
+    if pending_counteroffers:
+        await ctx.send(
+            sender,
+            CounterofferReply(
+                plan_id=msg.plan_id,
+                persona=name,
+                candidate_id=msg.candidate.id,
+                status="rejected",
+            ),
+        )
+        return
 
-    # Determine privately whether a relaxation is possible.
+    # Calculate the smallest possible relaxation privately.
     changes = minimal_relaxation(persona, msg.candidate)
 
     if changes is None:
@@ -566,19 +720,57 @@ async def on_counteroffer_request(
                 plan_id=msg.plan_id,
                 persona=name,
                 candidate_id=msg.candidate.id,
-                status="approved",
+                status="already_feasible",
             ),
         )
         return
 
-    # A change is possible, but the human must approve it.
+    # Private approval requires one unambiguous owner.
+    owners = [
+        address.strip()
+        for address in os.getenv(
+            f"{name.upper()}_OWNER_ADDRESSES", ""
+        ).split(",")
+        if address.strip()
+    ]
+
+    if len(owners) != 1:
+        await ctx.send(
+            sender,
+            CounterofferReply(
+                plan_id=msg.plan_id,
+                persona=name,
+                candidate_id=msg.candidate.id,
+                status="not_possible",
+            ),
+        )
+        return
+
     explanation = describe_relaxation(persona, changes)
 
-    ctx.logger.info(
-        "Counteroffer requires owner approval: plan=%s",
-        msg.plan_id,
+    pending_counteroffers[msg.plan_id] = {
+        "coordinator": sender,
+        "candidate": msg.candidate,
+        "changes": changes,
+        "owner": owners[0],
+        "created_at": time.monotonic(),
+    }
+
+    private_message = (
+        f"PRIVATE COUNTEROFFER\n"
+        f"Plan: {msg.plan_id}\n"
+        f"Restaurant: {msg.candidate.name}\n"
+        f"Time: {msg.candidate.slot}\n\n"
+        f"Proposed compromise: {explanation}\n\n"
+        f"Reply APPROVE {msg.plan_id} to accept, "
+        f"or REJECT {msg.plan_id} to decline.\n"
+        f"No changes have been made."
     )
 
+    # Send the explanation only to the personal agent's owner.
+    await reply(ctx, owners[0], private_message)
+
+    # The coordinator learns only that approval is required.
     await ctx.send(
         sender,
         CounterofferReply(
@@ -588,11 +780,6 @@ async def on_counteroffer_request(
             status="approval_required",
         ),
     )
-
-    # Do not send private constraint values to the coordinator.
-    # Do not change preferences automatically.
-    # The owner-facing approval flow will be connected next.
-
 @agent.on_message(ScoreReply)
 async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
     plan = plans.get(msg.plan_id)
