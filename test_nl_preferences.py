@@ -1,11 +1,14 @@
 import copy
+import io
 import json
 import os
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
-from nl_preferences import propose
+import nl_preferences
+from nl_preferences import propose, stepfun_chat
 from preferences import validate_update
 
 BASE = Path(__file__).resolve().parent
@@ -103,8 +106,64 @@ class NaturalLanguageTests(unittest.TestCase):
         self.assertEqual(p.update['never_cuisines'], ['steak'])
 
 
-@unittest.skipUnless(os.environ.get('STEPFUN_LIVE_TEST') and os.environ.get('STEPFUN_API_KEY'),
-                     'set STEPFUN_LIVE_TEST=1 and STEPFUN_API_KEY to call the real step-5-preview')
+class StepFunCallTests(unittest.TestCase):
+    """The real stepfun_chat against a fake HTTP layer: retries, hints, cut-off answers."""
+
+    def urlopen(self, *results):
+        results, calls = list(results), []
+
+        def fake(req, timeout):
+            calls.append(json.loads(req.data))
+            r = results.pop(0)
+            if isinstance(r, int):
+                raise urllib.error.HTTPError(req.full_url, r, 'err', {}, io.BytesIO(b''))
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = json.dumps({'choices': [r]}).encode()
+            return resp
+        fake.calls = calls
+        return fake
+
+    def call(self, fake):
+        with mock.patch.dict(os.environ, {'STEP_API_KEY': 'test-key'}), \
+             mock.patch.object(nl_preferences.urllib.request, 'urlopen', fake):
+            return stepfun_chat('sys', 'hi', sleep=lambda s: None)
+
+    def test_request_matches_stepfun_starter(self):
+        fake = self.urlopen({'finish_reason': 'stop', 'message': {'content': '{}'}})
+        self.assertEqual(self.call(fake), '{}')
+        body = fake.calls[0]
+        self.assertEqual((body['model'], body['reasoning_effort'], body['max_tokens']), ('step-5-preview', 'low', 4096))
+        self.assertEqual(nl_preferences.STEPFUN_URL, 'https://api.stepfun.ai/v1/chat/completions')
+
+    def test_429_and_5xx_retry_with_backoff(self):
+        fake = self.urlopen(429, 503, {'finish_reason': 'stop', 'message': {'content': '{"max_price": 30}'}})
+        self.assertEqual(self.call(fake), '{"max_price": 30}')
+        self.assertEqual(len(fake.calls), 3)
+
+    def test_errors_carry_stepfun_hints(self):
+        for code, hint in ((402, 'balance'), (401, 'STEP_API_KEY'), (429, 'rate or quota')):
+            with self.assertRaises(nl_preferences.StepFunError) as e:
+                self.call(self.urlopen(*([code] * 3)))
+            self.assertIn(f'HTTP {code}', str(e.exception))
+            self.assertIn(hint, str(e.exception))
+
+    def test_cut_off_answer_is_an_error(self):
+        with self.assertRaises(nl_preferences.StepFunError):
+            self.call(self.urlopen({'finish_reason': 'length', 'message': {'content': ''}}))
+
+    def test_hint_reaches_the_owner(self):
+        def broke(system, user):
+            raise nl_preferences.StepFunError('StepFun HTTP 402: check the StepFun balance or voucher')
+        p = propose('cheaper', PERSONAS['maya'], broke)
+        self.assertIn('balance or voucher', p.rejected[0])
+
+    def test_missing_key(self):
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(nl_preferences.StepFunError):
+            stepfun_chat('sys', 'hi')
+
+
+@unittest.skipUnless(os.environ.get('STEPFUN_LIVE_TEST') and (os.environ.get('STEP_API_KEY') or os.environ.get('STEPFUN_API_KEY')),
+                     'set STEPFUN_LIVE_TEST=1 and STEP_API_KEY to call the real step-5-preview')
 class LiveStepFunTests(unittest.TestCase):
     def test_real_model_extracts_and_validates(self):
         p = propose("I'm vegetarian now, can't do Saturday anymore, and ideally keep it under $20",
