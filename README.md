@@ -72,19 +72,46 @@ python memory.py seed-demo                          # load the fictional demo gr
 TEST_DATABASE_URL="$DATABASE_URL" python -m unittest test_memory   # opt-in; uses a throwaway schema
 ```
 
-### Natural-language preferences (StepFun `step-5-preview`)
+### Natural-language preferences (StepFun Step 5 Preview)
 
-`nl_preferences.propose(text, persona)` turns a chat message such as *"I'm vegetarian now, can't do Saturday, ideally under $20"* into the same structured update that `set ...` produces. The owner still has to `confirm` it.
+**Where Step 5 Preview is called:** [`nl_preferences.py` → `stepfun_chat()`](nl_preferences.py#L74). It sends `POST https://api.stepfun.ai/v1/chat/completions` with `model: "step-5-preview"` and `reasoning_effort: "low"`. [`propose()`](nl_preferences.py#L193) is the entry point.
 
-- **Least data to the model:** StepFun sees only the sentence plus the public slots and cuisines, never the stored profile. It returns a delta that is applied locally.
-- **Never trusted:** every field is re-checked by `validate_update`. Unknown slots and fields are rejected one by one, and the result is only a proposal.
-- **Recovery:** `set ...` commands skip the model. A network error, timeout or bad JSON returns a clear message instead of crashing.
+**What the model contributes:** people describe what they want the way they'd text a friend, and Step 5 Preview turns that into a structured preference change, which is the one thing rules can't do well.
+
+| Input (one chat message) | Step 5 Preview output | What the owner sees, before they `confirm` |
+|---|---|---|
+| "I absolutely can't spend more than 30 bucks, and I'll never eat steak" | `{"max_price": 30, "never_cuisines_add": ["steak"]}` | `max_price: 25 -> 30` / `never_cuisines: + steak` |
+| "I'd rather go Sunday, and I don't want to travel more than 20 min" | `{"preferred_slots_add": ["2026-10-25T18:00"], "max_distance_min": 20}` | `preferred_slots: + Oct 25 at 6pm` / `max_distance_min: 15 -> 20` |
+| "Ratings matter way more to me than price" | `{"weights": {"rating": 10, "price": 2}}` | `weights.price: 14% -> 10% of the decision` |
+
+**Users stay in control:**
+- The model only *proposes*. The owner sees every change in plain words and decides with `confirm` or `cancel`.
+- Deterministic code applies the change: `validate_update` re-checks every field, and unknown slots or fields are rejected one by one.
+- The fairness decision itself never uses an LLM.
+
+**Privacy:** the model sees only the sentence plus the public slots and cuisines, never the stored profile. A test checks this.
+
+**Reliability:**
+- 429 and 5xx responses are retried with backoff (1 s, then 3 s).
+- 401/402/403/404 come back with StepFun's hint, for example "check the StepFun balance or voucher".
+- A cut-off answer is detected.
+- Any failure still leaves the plain `set ...` commands working, which skip the model.
 
 ```bash
-set -a; . ./.env; set +a        # STEPFUN_API_KEY (international platform: api.stepfun.ai)
+set -a; . ./.env; set +a        # STEP_API_KEY from platform.stepfun.ai (global platform)
 python nl_preferences.py sam "I'd rather go Sunday, and I don't want to travel more than 20 min"
 STEPFUN_LIVE_TEST=1 python -m unittest test_nl_preferences   # opt-in live call
 ```
+
+### What each part does
+
+| Part | Role |
+|---|---|
+| **StepFun Step 5 Preview** | Turns natural-language preferences into structured, validated changes |
+| **Fetch.ai uAgents + Agentverse + ASI:One** | Personal agents and group coordination. ASI:One is the chat interface, and Agentverse makes the agents discoverable. |
+| **Preference engine** (`scoring`, `ranking`, `constraints`, `fairness`, `negotiation`) | Deterministic hard vetoes, soft scoring and leximin fairness. No LLM, so the same inputs always give the same plan. |
+| **Tiger Data (Postgres)** | Group memory: shared likes and fairness credits across outings |
+| **Browser Use** | Checks real table availability on OpenTable after the group approves. A dry run, so it never books. |
 
 ### Booking check (Browser Use)
 
