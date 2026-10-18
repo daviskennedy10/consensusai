@@ -52,6 +52,26 @@ Pure, deterministic Python (stdlib only), so it runs and tests without agents or
 
 On the demo data: *"Med Grill keeps everyone at 0.42 or higher; the highest-average option, Garden Fusion, would leave someone at 0.33."*
 
+### Group memory (Tiger Data / Postgres)
+
+`memory.py` is a small knowledge graph stored as plain Postgres tables, hosted on Tiger Data.
+- **Nodes:** `members`, `groups`
+- **Edges:** `member_of`, and `likes` (member to cuisine, with a score)
+- **State:** `fairness_credits` and `plans`
+
+It does three things:
+- **Fairness over time:** confirming a plan banks credit for whoever compromised, and `get_credits()` feeds `fairness.decide(history=...)`, so the same person doesn't lose every outing.
+- **No cold start:** returning members keep their shared likes, and `group_consensus()` walks group → members → cuisines.
+- **Consent:** it stores only what members chose to share, never deal breakers, and `forget_member()` deletes everything about a person.
+
+```bash
+echo 'DATABASE_URL=postgres://...' > .env           # Tiger connection string; .env is gitignored
+set -a; . ./.env; set +a
+python memory.py init                               # create tables (idempotent)
+python memory.py seed-demo                          # load the fictional demo group
+TEST_DATABASE_URL="$DATABASE_URL" python -m unittest test_memory   # opt-in; uses a throwaway schema
+```
+
 ### Why fairness beats averaging
 
 `python bench_fairness.py` simulates random groups through the real `evaluate` → `build_complete_table` → `decide` path. "Worst-off better off" means the fair pick strictly raised the least-satisfied person's score compared with picking the highest average.
