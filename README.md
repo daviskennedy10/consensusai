@@ -49,7 +49,7 @@ export ORGANIZER_SEED='your-demo-organizer-seed'
 python organizer.py
 ```
 
-**Start organizer first to obtain its address**, then set `ORGANIZER_ADDRESS` for all personal agent terminals and launch them. On each personal agent's ASI:One chat, type `help` to see commands, then e.g. `set max_price 30`, followed by `confirm`. `show` shows locally stored preferences. Owner allowlists are mandatory: an arbitrary stranger cannot change another person's settings. Scoring requests only come from the pinned organizer address. Runtime preferences persist under ignored `data/*.json`.
+**Start organizer first to obtain its address**, then set `ORGANIZER_ADDRESS` for all personal agent terminals and launch them. On each personal agent's ASI:One chat, type `help` to see commands, then describe a preference in plain words (StepFun turns it into a proposed change) or use e.g. `set max_price 30`, followed by `confirm`. **Do preference changes in a private chat with your agent:** in a group chat, everyone sees the agent's replies, including your budget and diet. In ASI:One, @mention the agent on every message (including `confirm`); un-mentioned messages go to your personal AI instead. `show` shows locally stored preferences. Owner allowlists are mandatory: an arbitrary stranger cannot change another person's settings. Scoring requests only come from the pinned organizer address. Runtime preferences persist under ignored `data/*.json`.
 
 Chat with the organizer via ASI:One / Agentverse Mailbox. Send `PLAN` to start the **fixed** restaurant/date scenario. The agent requires all three replies. On timeout it returns `INCOMPLETE` instead of violating someone's potentially unknown deal breakers.
 
@@ -165,6 +165,6 @@ How to read it: in roughly one group in eight (random tastes), and more when one
 - No live venue search or weather API. The restaurant dataset is fictional; dates are fixed at October 23–25, 2026.
 - Calendar link opens a draft event only (no invites are automatically sent).
 - No payments. A proposed plan does not mean all humans approved it.
-- Preference edits use **structured chat commands** plus a confirmation step, not free-form LLM parsing.
+- Plain-text preference edits go through StepFun, but the model only proposes: `validate_update` re-checks every change and nothing saves without the owner's `confirm`. Agents can't tell a group chat from a private one, so keeping edits private is up to the owner.
 - Local uAgents/ASI:One delivery must be tested against the live service. The automated tests only exercise pure Python logic.
 - The scoring reply includes a short reason. Avoid placing confidential values in reasons; use generic blockers.

@@ -12,6 +12,7 @@ CLI: python booking.py "Water Grill" 2026-10-24T19:00 3
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -21,16 +22,17 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 API = 'https://api.browser-use.com/api/v2'
-MAX_STEPS = 25          # bounds cost; the v2 API has no stop-task call
-TIMEOUT_S = 240
+MAX_STEPS = 20          # bounds cost; the v2 API has no stop-task call
+TIMEOUT_S = 180         # live checks took 21 s to 3 min
 POLL_S = 3
 DONE = {'finished', 'failed', 'stopped'}
 RESULT_SCHEMA = json.dumps({
     'type': 'object',
     'properties': {
-        'outcome': {'type': 'string', 'enum': ['available', 'unavailable', 'not_found', 'blocked']},
+        'outcome': {'type': 'string', 'enum': ['available', 'unavailable', 'no_reservations', 'not_found', 'blocked']},
         'bookable_times': {'type': 'array', 'items': {'type': 'string'}},
-        'booking_url': {'type': 'string'},
+        'platform': {'type': 'string', 'enum': ['opentable', 'tock', 'resy', 'own_site', 'other']},
+        'restaurant_page_url': {'type': 'string'},  # the venue's own page on that platform, never a checkout page
         'notes': {'type': 'string'},
     },
     'required': ['outcome'],
@@ -39,7 +41,7 @@ RESULT_SCHEMA = json.dumps({
 
 @dataclass(frozen=True)
 class Booking:
-    status: str                      # 'ready' (slot bookable, not booked) | 'unavailable' | 'fallback'
+    status: str                      # 'ready' (slot bookable, not booked) | 'unavailable' | 'walk_in' | 'fallback'
     venue: str
     slot: str
     party_size: int
@@ -48,6 +50,7 @@ class Booking:
     notes: str = ''
     task_id: Optional[str] = None
     cost: Optional[str] = None
+    what: str = ''                   # movie label (e.g. 'to watch Primetime') for showtime checks
 
 
 def deep_link(venue, slot, party_size, city='Los Angeles'):
@@ -57,11 +60,45 @@ def deep_link(venue, slot, party_size, city='Los Angeles'):
 
 def dry_run_task(venue, slot, party_size, city):
     date, hhmm = slot.split('T')
-    return (f'Find the restaurant "{venue}" in {city} on OpenTable (or its own reservation page). '
-            f'Check whether a table for {party_size} is available on {date} at {hhmm}, and note bookable times '
-            'within 90 minutes of it. This is an availability check only: NEVER enter a name, phone, email or '
-            'card, and NEVER click a final reserve, complete or confirm button. Stop on the page where a human '
-            'would enter their details, and report the outcome, the bookable times, and that page URL.')
+    return (f'Find the restaurant "{venue}" in {city} on its reservation platform (OpenTable, Tock, Resy, or its '
+            f'own site). Check whether a table for {party_size} is available on {date} at {hhmm}, and note bookable '
+            'times within 90 minutes of it. If the restaurant takes no online reservations at all (walk-in only), '
+            'report outcome no_reservations. This is an availability check only: NEVER enter a name, phone, email or '
+            'card, and NEVER click a final reserve, complete or confirm button. Report the outcome, the bookable times, '
+            'the platform, and restaurant_page_url: the public URL of the restaurant\'s own page on that platform '
+            '(e.g. https://www.exploretock.com/<restaurant> or https://www.opentable.com/r/<restaurant>), NOT a checkout, '
+            'cart or guest-details page, which only works inside this browser session.')
+
+
+def showtimes_task(theater, title, slot, city):
+    date, hhmm = slot.split('T')
+    return (f'Find showtimes for the movie "{title}" at the theater "{theater}" in {city} on {date}, within 90 minutes '
+            f'of {hhmm}, using the theater\'s site, Fandango or Google. NEVER buy tickets, NEVER enter a name, email or '
+            'card, and NEVER click purchase or checkout. Report outcome available (showtimes found near that time), '
+            'unavailable (playing that day but not near that time), or not_found (not playing there that day); '
+            'bookable_times = those showtimes; platform other; restaurant_page_url = the public page listing those '
+            'showtimes, NOT a checkout or seat-selection page.')
+
+
+def share_link(platform, page_url, slot, party_size, fallback):
+    """A link a human can open on their own phone with date, time and party size filled in.
+    Checkout/cart pages are tied to the agent's browser session, so they are never forwarded.
+    shortcut: the query formats are each platform's public deep links as far as we know; verify by tapping."""
+    p = urllib.parse.urlsplit(page_url or '')
+    if p.scheme != 'https' or not p.netloc or re.search(r'checkout|cart|guest|details|confirm', p.path, re.I):
+        return fallback
+    date, hhmm = slot.split('T')
+    parts = [x for x in p.path.split('/') if x]
+    host = p.netloc.lower()
+    if platform == 'tock' and host.endswith('exploretock.com') and parts:
+        return f"https://www.exploretock.com/{parts[0]}/search?{urllib.parse.urlencode({'date': date, 'size': party_size, 'time': hhmm})}"
+    if platform == 'opentable' and host.endswith('opentable.com'):
+        return f"https://{p.netloc}{p.path}?{urllib.parse.urlencode({'dateTime': slot, 'covers': party_size})}"
+    if platform == 'movie':  # showtime pages keep their query (it usually carries the date)
+        return page_url
+    if platform == 'resy' and host.endswith('resy.com'):
+        return f"https://resy.com{p.path}?{urllib.parse.urlencode({'date': date, 'seats': party_size})}"
+    return f'https://{p.netloc}{p.path}'
 
 
 def http(method, path, body=None, timeout=30):
@@ -75,13 +112,19 @@ def http(method, path, body=None, timeout=30):
 
 
 def check_availability(venue, slot, party_size, city='Los Angeles', request=http, sleep=time.sleep,
-                       timeout_s=TIMEOUT_S) -> Booking:
+                       timeout_s=TIMEOUT_S, what='') -> Booking:
+    """Restaurant table check, or (with `what`, a movie label) a showtime check. Never books or buys."""
     if not 1 <= int(party_size) <= 20:
         raise ValueError('party_size must be between 1 and 20')
-    link = deep_link(venue, slot, party_size, city)
-    fallback = lambda notes, task_id=None, cost=None: Booking('fallback', venue, slot, party_size, link, (), notes, task_id, cost)
+    title = what.removeprefix('to watch ').strip() if what else ''
+    if what:
+        q = urllib.parse.urlencode({'q': f"showtimes {title if title != 'a movie' else ''} {venue} {slot[:10]}"})
+        link, task_text = f'https://www.google.com/search?{q}', showtimes_task(venue, title or 'any movie', slot, city)
+    else:
+        link, task_text = deep_link(venue, slot, party_size, city), dry_run_task(venue, slot, party_size, city)
+    fallback = lambda notes, task_id=None, cost=None: Booking('fallback', venue, slot, party_size, link, (), notes, task_id, cost, what)
     try:
-        task = request('POST', '/tasks', {'task': dry_run_task(venue, slot, party_size, city), 'startUrl': link,
+        task = request('POST', '/tasks', {'task': task_text, 'startUrl': link,
                                           'maxSteps': MAX_STEPS, 'structuredOutput': RESULT_SCHEMA,
                                           'metadata': {'app': 'consensusai', 'mode': 'dry_run'}})
         task_id, waited = task['id'], 0
@@ -103,22 +146,32 @@ def check_availability(venue, slot, party_size, city='Los Angeles', request=http
         outcome = out['outcome']
     except (ValueError, KeyError, TypeError):
         return fallback('booking agent gave no readable result; finish with the link', task_id, cost)
-    page = out.get('booking_url') or ''
-    page = page if page.startswith('https://') else link  # only hand people an https page the agent reached
+    page = share_link('movie' if what else out.get('platform'), out.get('restaurant_page_url'), slot, party_size, link)
     times = tuple(str(t) for t in out.get('bookable_times') or ())
     if outcome == 'available':
-        return Booking('ready', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
+        return Booking('ready', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost, what)
     if outcome == 'unavailable':
-        return Booking('unavailable', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
+        return Booking('unavailable', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost, what)
+    if outcome == 'no_reservations':  # not full: there is simply nothing to book
+        return Booking('walk_in', venue, slot, party_size, page, (), out.get('notes', ''), task_id, cost)
     return fallback(f"booking site {outcome}: {out.get('notes', '')}".strip(), task_id, cost)
 
 
 def message(b: Booking) -> str:
     """Chat-ready line for the organizer."""
     when = b.slot.replace('T', ' at ')
+    if b.what:
+        if b.status == 'ready':
+            return (f"Showtimes {b.what} at {b.venue} near {when}: {', '.join(b.times) or 'see link'}. "
+                    f'Tickets are not bought; get them here: {b.link}')
+        if b.status == 'unavailable':
+            return f"No showtimes {b.what} at {b.venue} near {when}. Other times: {', '.join(b.times) or 'none'}. {b.link}"
+        return f'Could not confirm showtimes {b.what} at {b.venue} ({b.notes or "check by hand"}): {b.link}'
     if b.status == 'ready':
         near = f" Other times: {', '.join(b.times)}." if b.times else ''
-        return f'A table for {b.party_size} at {b.venue} on {when} is available.{near} Not booked yet; confirm here: {b.link}'
+        return f'A table for {b.party_size} at {b.venue} on {when} is available.{near} Not booked yet; reserve it here: {b.link}'
+    if b.status == 'walk_in':
+        return f"{b.venue} doesn't take reservations: just walk in."
     if b.status == 'unavailable':
         near = f" Nearby times: {', '.join(b.times)}." if b.times else ' No nearby times.'
         return f'{b.venue} has no table for {b.party_size} on {when}.{near} {b.link}'

@@ -5,7 +5,9 @@ State: fairness_credits (feeds fairness.decide(history=...)) and plans.
 
 Consent: only what a member chose to share through their own agent is stored, never
 profiles of non-users, and forget_member() deletes everything about a person.
-Deal breakers (hard constraints) are NOT stored here; they stay inside each personal agent.
+`personas` is the personal agent service's private store (deal breakers included): only
+that member's own agent reads it; group-facing code sees only scores and veto categories.
+`contacts` remembers each member's chat thread so the agent can message the whole group.
 shortcut: no per-role access control (row-level security); every agent with DATABASE_URL
 can read every table. Add RLS or per-agent roles before real users.
 
@@ -46,6 +48,20 @@ CREATE TABLE IF NOT EXISTS fairness_credits (
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (group_id, member_id),
     FOREIGN KEY (group_id, member_id) REFERENCES member_of ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS personas (
+    member_id text PRIMARY KEY REFERENCES members ON DELETE CASCADE,
+    persona jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS contacts (
+    member_id text PRIMARY KEY REFERENCES members ON DELETE CASCADE,
+    channel text NOT NULL,
+    space_id text NOT NULL,
+    agent_id text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS sessions (
+    key text PRIMARY KEY,
+    data jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS plans (
     id text PRIMARY KEY,
     group_id text NOT NULL REFERENCES groups ON DELETE CASCADE,
@@ -79,6 +95,70 @@ def create_group(conn, group_id, name, member_ids):
                      (group_id, name))
         for m in member_ids:
             conn.execute('INSERT INTO member_of VALUES (%s, %s) ON CONFLICT DO NOTHING', (group_id, m))
+
+
+def member_name(conn, member_id):
+    row = conn.execute('SELECT display_name FROM members WHERE id = %s', (member_id,)).fetchone()
+    return row[0] if row else None
+
+
+def get_persona(conn, member_id):
+    row = conn.execute('SELECT persona FROM personas WHERE member_id = %s', (member_id,)).fetchone()
+    return row[0] if row else None
+
+
+def save_persona(conn, member_id, persona):
+    with conn.transaction():
+        conn.execute('INSERT INTO personas (member_id, persona) VALUES (%s, %s) ON CONFLICT (member_id) '
+                     'DO UPDATE SET persona = EXCLUDED.persona, updated_at = now()', (member_id, Jsonb(persona)))
+
+
+def save_contact(conn, member_id, channel, space_id, agent_id):
+    with conn.transaction():
+        conn.execute('INSERT INTO contacts (member_id, channel, space_id, agent_id) VALUES (%s, %s, %s, %s) '
+                     'ON CONFLICT (member_id) DO UPDATE SET channel = EXCLUDED.channel, space_id = EXCLUDED.space_id, '
+                     'agent_id = EXCLUDED.agent_id, updated_at = now()', (member_id, channel, space_id, agent_id))
+
+
+def get_contact(conn, member_id):
+    row = conn.execute('SELECT channel, space_id, agent_id FROM contacts WHERE member_id = %s', (member_id,)).fetchone()
+    return dict(zip(('channel', 'space_id', 'agent_id'), row)) if row else None
+
+
+def member_group(conn, member_id):
+    """The member's most recently created group, or None."""
+    row = conn.execute('SELECT g.id FROM groups g JOIN member_of m ON m.group_id = g.id WHERE m.member_id = %s '
+                       'ORDER BY g.created_at DESC LIMIT 1', (member_id,)).fetchone()
+    return row[0] if row else None
+
+
+def group_exists(conn, group_id):
+    return conn.execute('SELECT 1 FROM groups WHERE id = %s', (group_id,)).fetchone() is not None
+
+
+def latest_plan(conn, group_id):
+    row = conn.execute("SELECT id, candidate_id, metrics FROM plans WHERE group_id = %s AND status = 'proposed' "
+                       'ORDER BY created_at DESC LIMIT 1', (group_id,)).fetchone()
+    return dict(zip(('id', 'candidate_id', 'metrics'), row)) if row else None
+
+
+def save_session(conn, key, data):
+    """The latest planning session for a group (or a solo member): invites, answers, the plan."""
+    with conn.transaction():
+        conn.execute('INSERT INTO sessions (key, data) VALUES (%s, %s) ON CONFLICT (key) '
+                     'DO UPDATE SET data = EXCLUDED.data, updated_at = now()', (key, Jsonb(data)))
+
+
+def get_session(conn, key):
+    row = conn.execute('SELECT data FROM sessions WHERE key = %s', (key,)).fetchone()
+    return row[0] if row else None
+
+
+def invited_session(conn, member_id):
+    """The newest session still waiting for this member's IN/OUT."""
+    row = conn.execute("SELECT data FROM sessions WHERE data->'answers'->>%s = 'asked' ORDER BY updated_at DESC LIMIT 1",
+                       (member_id,)).fetchone()
+    return row[0] if row else None
 
 
 def group_members(conn, group_id):
