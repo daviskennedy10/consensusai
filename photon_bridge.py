@@ -1,7 +1,8 @@
 """iMessage bridge via Photon v2 (HTTP API, stdlib only). Run: python photon_bridge.py
 
-Polls Photon for received iMessages and replies in the same direct space. For now it
-echoes; `handle(text, sender)` is the single place to plug in the ConsensusAI back end.
+Polls Photon for received iMessages and passes each one to a "brain": ConsensusAI
+(consensus_service) when DATABASE_URL is set, otherwise an echo. A brain yields
+(contact, text) replies, which may go to the sender or to other group members.
 Shared-line rules (Photon): direct chats only, and only to registered users who texted first.
 Replies are plain messages in the same space: a parentMessageId (threaded reply) gets
 409 SPACE_NOT_SENDABLE on shared iMessage lines.
@@ -42,14 +43,13 @@ def is_inbound_dm(m):
             and agent.get('kind') == 'agent' and space.get('kind') == 'direct' and sender.get('id') != agent.get('id'))
 
 
-def handle(text, sender):
-    """The reply for one inbound message. Swap in the ConsensusAI back end here."""
-    return f'ConsensusAI is connected. You said: {text}'
+def echo(member, text, contact):
+    yield contact, f'ConsensusAI is connected. You said: {text}'
 
 
-def reply(project, key, m, text):
-    request('POST', f'/projects/{project}/messages', key=key, headers={'idempotency-key': f'consensusai-reply:{m["id"]}'},
-            body={'spaceId': m['space']['id'], 'senderId': m['receivedBy']['id'],
+def send(project, key, contact, text, idempotency_key):
+    request('POST', f'/projects/{project}/messages', key=key, headers={'idempotency-key': idempotency_key},
+            body={'spaceId': contact['space_id'], 'senderId': contact['agent_id'],
                   'content': {'type': 'text', 'format': 'plain', 'text': text}})
 
 
@@ -61,7 +61,7 @@ def problem(e):
         return ''
 
 
-def run(project, key, sleep=time.sleep, stop=lambda: False):
+def run(project, key, sleep=time.sleep, stop=lambda: False, brain=echo):
     since = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     seen, backoff = set(), POLL_S
     print(f'bridge ready: polling project {project[:12]}… every {POLL_S}s', flush=True)
@@ -81,16 +81,22 @@ def run(project, key, sleep=time.sleep, stop=lambda: False):
                         print(f'skip non-text message from {mask(sender)}', flush=True)
                         continue
                     print(f'in  {mask(sender)}: {len(text)} chars', flush=True)
+                    contact = {'channel': 'imessage', 'space_id': m['space']['id'], 'agent_id': m['receivedBy']['id']}
+                    sent = 0
                     try:
-                        reply(project, key, m, handle(text, sender))
+                        for i, (to, out) in enumerate(brain(sender, text, contact)):
+                            send(project, key, to, out, f'consensusai:{m["id"]}:{i}')
+                            sent += 1
                     except urllib.error.HTTPError as e:
                         if e.code in (429, 500, 502, 503, 504):
-                            raise  # transient: not marked seen, so the next poll retries (idempotency key dedupes)
-                        seen.add(m['id'])
+                            raise  # transient: not marked seen; the retry re-sends with the same keys, Photon dedupes
                         print(f'out {mask(sender)}: reply refused, HTTP {e.code} {problem(e)}', file=sys.stderr, flush=True)
-                        continue
+                    except Exception as e:  # a brain bug must not kill the bridge or leave the person hanging
+                        print(f'brain error {type(e).__name__}: {e}', file=sys.stderr, flush=True)
+                        send(project, key, contact, 'Sorry, something went wrong on my side. Please try again.',
+                             f'consensusai:{m["id"]}:error')
                     seen.add(m['id'])
-                    print(f'out {mask(sender)}: reply accepted by Photon', flush=True)
+                    print(f'out {mask(sender)}: {sent} message(s) accepted by Photon', flush=True)
                 token = page.get('nextPageToken')
                 if not isinstance(token, str):
                     break
@@ -110,4 +116,9 @@ if __name__ == '__main__':
     missing = [k for k in ('PROJECT_ID', 'PROJECT_SECRET') if not os.environ.get(k)]
     if missing:
         raise SystemExit(f'Missing {", ".join(missing)} (set -a; . ./.env; set +a)')
-    run(os.environ['PROJECT_ID'], os.environ['PROJECT_SECRET'])
+    brain = echo
+    if os.environ.get('DATABASE_URL'):
+        import consensus_service
+        brain = consensus_service.from_env().handle
+    print(f'brain: {"consensusai" if brain is not echo else "echo"}', flush=True)
+    run(os.environ['PROJECT_ID'], os.environ['PROJECT_SECRET'], brain=brain)

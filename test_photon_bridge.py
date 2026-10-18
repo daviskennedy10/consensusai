@@ -31,7 +31,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(body['senderId'], 'agent1')
         self.assertNotIn('parentMessageId', body)  # threaded replies get 409 SPACE_NOT_SENDABLE on shared lines
         self.assertEqual(body['content'], {'type': 'text', 'format': 'plain', 'text': 'ConsensusAI is connected. You said: plan dinner'})
-        self.assertEqual(headers['idempotency-key'], 'consensusai-reply:m1')
+        self.assertEqual(headers['idempotency-key'], 'consensusai:m1:0')
 
     def test_transient_send_errors_retry_and_permanent_ones_do_not(self):
         import io, urllib.error
@@ -48,7 +48,26 @@ class BridgeTests(unittest.TestCase):
         with mock.patch.object(photon_bridge, 'request', fake):
             photon_bridge.run('pho_prj_x', 'k', sleep=lambda s: None, stop=lambda: next(polls))
         # poll 1: m1 hits 503 (retry later); poll 2: m1 hits 409 (give up), m2 succeeds
-        self.assertEqual(sends, ['consensusai-reply:m1', 'consensusai-reply:m1', 'consensusai-reply:m2'])
+        self.assertEqual(sends, ['consensusai:m1:0', 'consensusai:m1:0', 'consensusai:m2:0'])
+
+    def test_brain_can_message_other_members_and_crashes_are_answered(self):
+        sent, polls = [], iter([False, True])
+        other = {'channel': 'imessage', 'space_id': 's2', 'agent_id': 'agent1'}
+
+        def brain(member, text, contact):
+            yield contact, 'for you'
+            yield other, 'for your friend'
+            raise ValueError('boom')
+
+        def fake(method, path, body=None, headers=None, key=None):
+            if method == 'GET':
+                return {'items': [msg(1)]}
+            sent.append((body['spaceId'], body['content']['text'], headers['idempotency-key']))
+            return {}
+        with mock.patch.object(photon_bridge, 'request', fake):
+            photon_bridge.run('pho_prj_x', 'k', sleep=lambda s: None, stop=lambda: next(polls), brain=brain)
+        self.assertEqual(sent, [('s1', 'for you', 'consensusai:m1:0'), ('s2', 'for your friend', 'consensusai:m1:1'),
+                                ('s1', 'Sorry, something went wrong on my side. Please try again.', 'consensusai:m1:error')])
 
     def test_ignores_groups_agents_and_outbound(self):
         calls = self.run_once([{'items': [msg(1, kind='group'), msg(2, sender_kind='agent'), msg(3, status='sent')]}])

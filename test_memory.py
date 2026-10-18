@@ -81,6 +81,22 @@ class MemoryTests(unittest.TestCase):
         self.assertNotIn('sam', memory.group_members(self.conn, 'g'))
         self.assertNotIn('sam', memory.get_credits(self.conn, 'g'))
 
+    def test_personas_contacts_and_groups(self):
+        self.assertIsNone(memory.get_persona(self.conn, 'sam'))
+        memory.save_persona(self.conn, 'sam', {'hard': {'max_price': 30, 'dietary': ['halal']}})
+        memory.save_persona(self.conn, 'sam', {'hard': {'max_price': 35, 'dietary': ['halal']}})
+        self.assertEqual(memory.get_persona(self.conn, 'sam')['hard']['max_price'], 35)
+        memory.save_contact(self.conn, 'sam', 'imessage', 'spc1', 'agt1')
+        self.assertEqual(memory.get_contact(self.conn, 'sam'), {'channel': 'imessage', 'space_id': 'spc1', 'agent_id': 'agt1'})
+        self.assertEqual(memory.member_group(self.conn, 'sam'), 'g')
+        self.assertTrue(memory.group_exists(self.conn, 'g'))
+        d = fairness.decide({'X': {'maya': .5, 'jordan': .5, 'sam': .5}})
+        memory.record_plan(self.conn, 'p9', 'g', d)
+        self.assertEqual(memory.latest_plan(self.conn, 'g')['candidate_id'], 'X')
+        memory.forget_member(self.conn, 'sam')
+        self.assertIsNone(memory.get_persona(self.conn, 'sam'))
+        self.assertIsNone(memory.get_contact(self.conn, 'sam'))
+
     def test_seed_demo(self):
         memory.seed_demo(self.conn)
         self.assertEqual(memory.group_members(self.conn, 'demo'), ['jordan', 'maya', 'sam'])
