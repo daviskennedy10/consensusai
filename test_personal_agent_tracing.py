@@ -5,6 +5,7 @@ BEFORE its startup code runs. Domain scoring/negotiation functions remain real.
 Run explicitly with test_activity_trace; do not use integration-test discovery.
 """
 import copy
+import asyncio
 from contextlib import ExitStack
 from enum import Enum
 import importlib.util
@@ -36,6 +37,14 @@ class FakeModel(SimpleNamespace):
 
 
 class FakeChatMessage(FakeModel):
+    @staticmethod
+    def build_schema_digest(model):
+        assert model is FakeChatMessage
+        return "chat-message-schema"
+
+    def model_dump_json(self):
+        return json.dumps({"msg_id": str(self.msg_id), "content": [vars(c) for c in self.content]})
+
     def text(self):
         return "".join(item.text for item in self.content)
 
@@ -69,6 +78,12 @@ class FakeContext:
         self.storage = {}
         self.sent = []
         self.send = AsyncMock(side_effect=self._send)
+        self.raw_sent = []
+        self.send_raw = AsyncMock(side_effect=self._send_raw)
+
+    async def _send_raw(self, **kwargs):
+        self.raw_sent.append((kwargs, self.session))
+        return SimpleNamespace(status=DeliveryStatus.DELIVERED)
 
     @property
     def session(self):
@@ -128,7 +143,8 @@ class PersonalAgentTracingTests(unittest.IsolatedAsyncioTestCase):
             "uagents_core.contrib.protocols": module("uagents_core.contrib.protocols"),
             "uagents_core.contrib.protocols.chat": module(
                 "uagents_core.contrib.protocols.chat", ChatMessage=FakeChatMessage,
-                ChatAcknowledgement=FakeModel, TextContent=FakeModel, chat_protocol_spec=object()),
+                ChatAcknowledgement=FakeModel, TextContent=FakeModel,
+                chat_protocol_spec=SimpleNamespace(digest="chat-protocol-digest")),
             "memory": self.memory, "nl_preferences": self.nl,
             "venues": self.places, "booking": self.booking,
         }
@@ -472,13 +488,145 @@ class PersonalAgentTracingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("walk in", fresh.texts()[-1])
         self.nl.propose.assert_not_called()
 
+    async def test_notification_enrollment_authorization_and_exact_command(self):
+        await self.chat("NOTIFY HERE", sender="stranger")
+        self.assertEqual(self.app.owner_notification_sessions, {})
+        os.environ["ALEX_OWNER_ADDRESSES"] += ",agent-maya"
+        await self.chat("NOTIFY HERE", sender="agent-maya")
+        self.assertEqual(self.app.owner_notification_sessions, {})
+        await self.chat("NOTIFY HERE")
+        await self.chat("notify here", sender="owner-b", ctx=FakeContext("second-owner-chat"))
+        self.assertEqual(self.app.owner_notification_sessions,
+                         {"owner-a": "current-chat", "owner-b": "second-owner-chat"})
+        await self.chat("NOTIFY HERE", ctx=FakeContext("replacement-chat"))
+        self.assertEqual(self.app.owner_notification_sessions["owner-a"], "replacement-chat")
+        self.nl.propose.assert_not_called()
+        self.save_persona.assert_not_called()
+
+    async def incoming_offer(self):
+        os.environ["ALEX_OWNER_ADDRESSES"] = "owner-a"
+        costly = self.app.Candidate(**{**vars(self.candidate), "price": 120})
+        request = self.app.CounterofferRequest(plan_id="peer-plan", candidate=costly, category="budget")
+        await self.app.on_counteroffer_request(self.ctx, "agent-maya", request)
+        return self.app.pending_counteroffers["peer-plan"]
+
+    async def test_notification_routes_chat_schema_protocol_and_restores_peer_session(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        offer = await self.incoming_offer()
+        kwargs, session = self.ctx.raw_sent[0]
+        self.assertEqual(session, "private-owner-chat")
+        self.assertEqual(kwargs["destination"], "owner-a")
+        self.assertEqual(kwargs["protocol_digest"], "chat-protocol-digest")
+        self.assertEqual(kwargs["message_schema_digest"], "chat-message-schema")
+        message = json.loads(kwargs["message_body"])
+        self.assertEqual(message["msg_id"], str(offer["notification"]["message_id"]))
+        self.assertIn("PRIVATE COUNTEROFFER", message["content"][0]["text"])
+        self.assertIn("APPROVE peer-plan", message["content"][0]["text"])
+        self.assertEqual(self.ctx.session, "current-chat")
+        target, response, response_session = self.ctx.sent[-1]
+        self.assertEqual((target, response.status, response_session),
+                         ("agent-maya", "approval_required", "current-chat"))
+        self.assertEqual(offer["notification"]["transport_status"], "delivered")
+        self.assertFalse(offer["notification"]["acknowledged"])
+        self.assertNotIn("owner-a", str(self.ctx.logger.mock_calls))
+        self.assertNotIn("PRIVATE COUNTEROFFER", str(self.ctx.logger.mock_calls))
+        self.assertNotIn("budget", str(self.ctx.logger.mock_calls))
+        self.save_persona.assert_not_called()
+
+    async def test_notification_transport_failures_preserve_offer_and_restore_session(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        for status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERED, DeliveryStatus.FAILED, None):
+            with self.subTest(status=status):
+                self.app.pending_counteroffers.clear()
+                self.ctx.send_raw.side_effect = None
+                self.ctx.send_raw.return_value = SimpleNamespace(status=status)
+                offer = await self.incoming_offer()
+                self.assertEqual(offer["notification"]["transport_status"],
+                                 status.value if status else "unknown")
+                self.assertFalse(offer["notification"]["acknowledged"])
+                self.assertEqual(self.ctx.session, "current-chat")
+                self.assertEqual(self.ctx.sent[-1][1].status, "approval_required")
+        self.app.pending_counteroffers.clear()
+        self.ctx.send_raw.side_effect = RuntimeError("private-secret-sentinel")
+        offer = await self.incoming_offer()
+        self.assertEqual(offer["notification"]["transport_status"], "exception")
+        self.assertEqual(self.ctx.session, "current-chat")
+        self.assertEqual(self.ctx.sent[-1][1].status, "approval_required")
+        self.assertNotIn("private-secret-sentinel", str(self.ctx.logger.mock_calls))
+        await self.chat("OFFER")
+        self.assertIn("APPROVE peer-plan", self.ctx.texts()[-1])
+
+    async def test_notification_ack_requires_owner_session_and_message_id(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        offer = await self.incoming_offer()
+        record = offer["notification"]
+        ack = FakeModel(acknowledged_msg_id=record["message_id"])
+        private = FakeContext("private-owner-chat")
+        for sender, ctx, message in (
+            ("stranger", private, ack), ("agent-maya", private, ack),
+            ("owner-a", self.ctx, ack),
+            ("owner-a", private, FakeModel(acknowledged_msg_id="unknown"))):
+            await self.app.on_ack(ctx, sender, message)
+            self.assertFalse(record["acknowledged"])
+        os.environ["ALEX_OWNER_ADDRESSES"] = "owner-b"
+        await self.app.on_ack(private, "owner-a", ack)
+        self.assertFalse(record["acknowledged"])
+        os.environ["ALEX_OWNER_ADDRESSES"] = "owner-a"
+        # Late ack after offer cleanup still records transport evidence, not approval.
+        self.app.pending_counteroffers.clear()
+        await self.app.on_ack(private, "owner-a", ack)
+        await self.app.on_ack(private, "owner-a", ack)
+        self.assertTrue(record["acknowledged"])
+        private.logger.info.assert_called_once()
+        self.save_persona.assert_not_called()
+        self.assertEqual(self.app.activity_traces, {})
+
+    async def test_notification_ack_can_arrive_during_send(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        async def send(**kwargs):
+            message_id = next(iter(self.app.owner_notifications))
+            await self.app.on_ack(FakeContext("private-owner-chat"), "owner-a",
+                                  FakeModel(acknowledged_msg_id=message_id))
+            return SimpleNamespace(status=DeliveryStatus.SENT)
+        self.ctx.send_raw.side_effect = send
+        offer = await self.incoming_offer()
+        self.assertTrue(offer["notification"]["acknowledged"])
+        self.assertEqual(offer["notification"]["transport_status"], "sent")
+
+    async def test_notification_cancellation_restores_session(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        self.ctx.send_raw.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.incoming_offer()
+        self.assertEqual(self.ctx.session, "current-chat")
+        self.assertIn("peer-plan", self.app.pending_counteroffers)
+
+    async def test_notified_offer_rejection_does_not_save_preferences(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        await self.incoming_offer()
+        await self.chat("REJECT peer-plan")
+        self.assertNotIn("peer-plan", self.app.pending_counteroffers)
+        self.save_persona.assert_not_called()
+        self.assertTrue(any(getattr(message, "status", None) == "rejected"
+                            for _, message, _ in self.ctx.sent))
+
+    async def test_notified_offer_approval_preserves_workflow(self):
+        self.app.owner_notification_sessions["owner-a"] = "private-owner-chat"
+        await self.incoming_offer()
+        with patch.object(self.app, "remember_persona") as persist:
+            await self.chat("APPROVE peer-plan", ctx=FakeContext("private-owner-chat"))
+        self.save_persona.assert_called_once()
+        persist.assert_called_once()
+        self.assertNotIn("peer-plan", self.app.pending_counteroffers)
+        self.ctx.send_raw.assert_awaited_once()
+
     async def test_private_offer_and_approval_keep_save_order_and_private_data_out(self):
         os.environ["ALEX_OWNER_ADDRESSES"] = "owner-a"
         costly = self.app.Candidate(**{**vars(self.candidate), "price": 120})
         request = self.app.CounterofferRequest(plan_id="peer-plan", candidate=costly, category="budget")
         await self.app.on_counteroffer_request(self.ctx, "agent-maya", request)
         self.assertIn("peer-plan", self.app.pending_counteroffers)
-        self.assertEqual(self.ctx.sent[0][0], "owner-a")
+        self.ctx.send_raw.assert_not_called()  # no enrollment; OFFER still recovers it
         self.assertEqual(self.ctx.sent[-1][1].status, "approval_required")
         await self.chat("OFFER")
         self.assertIn("APPROVE peer-plan", self.ctx.texts()[-1])

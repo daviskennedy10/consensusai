@@ -75,6 +75,11 @@ plans = {}
 latest_status = {}
 # Counteroffers awaiting the owner of THIS personal agent.
 pending_counteroffers = {}
+
+# Explicit owner enrollment; process-local and never populated by peer requests.
+owner_notification_sessions = {}
+# Transport evidence only: neither dispatch nor acknowledgement proves human viewing.
+owner_notifications = {}
 # Negotiations coordinated by THIS agent.
 negotiations = {}
 
@@ -140,6 +145,46 @@ persona = {**persona, **(load_from_tiger() or {})}
 port = persona['port']
 agent = Agent(name=f'consensusai-{name}', seed=persona['seed'], port=port, mailbox=True)
 chat = Protocol(spec=chat_protocol_spec)
+
+async def notify_counteroffer_owner(ctx, offer, private_message):
+    owner = offer["owner"]
+    session = owner_notification_sessions.get(owner)
+    notification = {"message_id": None, "session": session, "owner": owner,
+                    "transport_status": "not_enrolled", "acknowledged": False}
+    offer["notification"] = notification
+    if session is None:
+        ctx.logger.info("Private counteroffer notification: no enrolled session; OFFER remains available")
+        return
+
+    message = ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),
+                          content=[TextContent(type="text", text=private_message)])
+    notification["message_id"] = message.msg_id
+    notification["transport_status"] = "pending"
+    # Register before awaiting transport: an acknowledgement can arrive during send.
+    owner_notifications[message.msg_id] = notification
+    original_session = ctx.session
+    try:
+        ctx._session = session
+        result = await ctx.send_raw(
+            destination=owner,
+            message_schema_digest=ChatMessage.build_schema_digest(ChatMessage),
+            message_body=message.model_dump_json(),
+            protocol_digest=chat_protocol_spec.digest,
+        )
+        status = getattr(result, "status", None)
+        notification["transport_status"] = {
+            DeliveryStatus.SENT: "sent", DeliveryStatus.DELIVERED: "delivered",
+            DeliveryStatus.FAILED: "failed",
+        }.get(status, "unknown")
+        ctx.logger.info("Private counteroffer notification transport: %s (not a read receipt)",
+                        notification["transport_status"])
+    except Exception:
+        notification["transport_status"] = "exception"
+        # Exception strings and transport details can contain private payloads/addresses.
+        ctx.logger.warning("Private counteroffer notification failed; OFFER remains available")
+    finally:
+        ctx._session = original_session
+
 
 async def reply(ctx, target, message):
     ctx.logger.info(
@@ -711,6 +756,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         "offer",
         "book",
         "trace",
+        "notify here",
     }
 
     lower_text = text.lower()
@@ -733,6 +779,15 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
     if not allowed or sender not in allowed:
         await reply(ctx, sender, 'Preference edits disabled. Set '+name.upper()+'_OWNER_ADDRESSES to the allowed ASI:One sender address. Ask the agent operator to configure it.')
+        return
+
+    if lower_text == "notify here":
+        if sender in ADDR.values():
+            return
+        owner_notification_sessions[sender] = ctx.session
+        await reply(ctx, sender, "This chat is enrolled for private counteroffer notifications until "
+                    "the agent restarts. Use NOTIFY HERE only in your private chat. "
+                    "OFFER remains available if a notification does not appear.")
         return
 
     if lower_text == "trace":
@@ -972,7 +1027,14 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
 
 @chat.on_message(ChatAcknowledgement)
 async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
-    pass
+    notification = owner_notifications.get(msg.acknowledged_msg_id)
+    allowed = [x.strip() for x in os.getenv(f'{name.upper()}_OWNER_ADDRESSES', '').split(',') if x.strip()]
+    if (notification is None or sender not in allowed or sender in ADDR.values()
+            or sender != notification["owner"] or ctx.session != notification["session"]):
+        return
+    if not notification["acknowledged"]:
+        notification["acknowledged"] = True
+        ctx.logger.info("Private counteroffer notification acknowledged (not a read receipt)")
 
 @agent.on_message(ScoreRequest)
 async def on_score(ctx: Context, sender: str, msg: ScoreRequest):
@@ -1089,7 +1151,7 @@ async def on_counteroffer_request(
     )
 
     # Send the explanation only to the personal agent's owner.
-    await reply(ctx, owners[0], private_message)
+    await notify_counteroffer_owner(ctx, pending_counteroffers[msg.plan_id], private_message)
 
     # The coordinator learns only that approval is required.
     await ctx.send(
