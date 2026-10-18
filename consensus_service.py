@@ -29,6 +29,7 @@ from scoring import evaluate
 DEFAULT_PERSONA = {'hard': {'max_price': 60, 'max_distance_min': 30, 'dietary': [], 'busy_days': []},
                    'cuisine_pref': {}, 'weights': {'cuisine': 1, 'rating': 1, 'distance': 1, 'price': 1}}
 DEFAULT_AREA = 'Westwood, Los Angeles'
+BOOK_TRIES = 2  # top pick + runner-up; each check takes 1-3 minutes
 CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # no 0/O/1/I
 DAYS = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
 HELP = ("ConsensusAI plans group outings fairly, and keeps your deal breakers private.\n"
@@ -229,7 +230,8 @@ class Service:
         c = by_id[d.chosen]
         if group:
             self.store.record_plan(f'{group}-{self.rng.randrange(16**6):06x}', group, d)
-        self.plans[group or member] = {'venue': c.name, 'slot': slot, 'size': len(members), 'area': area}
+        self.plans[group or member] = {'venue': c.name, 'slot': slot, 'size': len(members), 'area': area,
+                                       'options': [by_id[cid].name for cid in d.ranking[:BOOK_TRIES]]}
         who = f'the {len(members)} of you' if len(members) > 1 else 'you'
         base = (f"Plan for {who}: {c.name} ({c.cuisine}, {c.rating:.1f} stars, about ${c.price} per person), "
                 f"{when(slot)} near {area.split(',')[0]}.\n{d.explanation}\n"
@@ -265,9 +267,18 @@ class Service:
         if not p:
             yield contact, 'No plan yet. Text PLAN dinner sat 7pm near Westwood first.'
             return
-        yield contact, f"Checking OpenTable for a table for {p['size']} at {p['venue']}, {when(p['slot'])}... (up to 2 minutes)"
-        b = self.check_table(p['venue'], p['slot'], p['size'], city=p['area'].split(',')[-1].strip() or 'Los Angeles')
-        yield from self.to_all(members, booking.message(b), contact, member)
+        city = p['area'].split(',')[-1].strip() or 'Los Angeles'
+        options = p.get('options') or [p['venue']]
+        yield contact, f"Checking OpenTable for a table for {p['size']} at {options[0]}, {when(p['slot'])}... (usually 1-3 minutes)"
+        misses = []
+        for i, venue in enumerate(options):  # fair order: top pick, then the runner-up
+            b = self.check_table(venue, p['slot'], p['size'], city=city)
+            if b.status == 'ready' or i == len(options) - 1:
+                break
+            misses.append(venue)
+            yield contact, f'No table found at {venue}. Checking the runner-up, {options[i + 1]}...'
+        note = f"No table at {', '.join(misses)}. " if misses and b.status == 'ready' else ''
+        yield from self.to_all(members, note + booking.message(b), contact, member)
 
     def busy(self, member, contact):
         group, members = self.group_or_solo(member)

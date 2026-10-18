@@ -111,6 +111,32 @@ class ServiceTests(unittest.TestCase):
         self.assertIn('Not booked yet', out[1][1])
         self.assertEqual(seen, [('Steakhouse', SAT, 1, 'Los Angeles')])
 
+    def test_book_falls_back_to_runner_up(self):
+        tried = []
+
+        def table(v, s, n, city):
+            tried.append(v)
+            status = 'unavailable' if v == 'Steakhouse' else 'ready'
+            return booking.Booking(status, v, s, n, 'https://www.opentable.com/x', ('7:15 PM',))
+        h = Harness(table=table)
+        h.say('+1A', 'hi')
+        h.say('+1A', 'plan dinner sat 7pm')
+        out = h.say('+1A', 'book')
+        self.assertEqual(tried, ['Steakhouse', 'Greens'])   # fair order: top pick, then runner-up
+        self.assertIn('usually 1-3 minutes', out[0][1])
+        self.assertIn('Checking the runner-up, Greens', out[1][1])
+        self.assertTrue(out[2][1].startswith('No table at Steakhouse. A table for 1 at Greens'))
+
+    def test_book_stops_after_two_tries(self):
+        tried = []
+        h = Harness(table=lambda v, s, n, city: tried.append(v) or booking.Booking('unavailable', v, s, n, 'https://x', ()),
+                    places=lambda a, s: ([venue('a'), venue('b'), venue('c')], []))
+        h.say('+1A', 'hi')
+        h.say('+1A', 'plan dinner sat 7pm')
+        out = h.say('+1A', 'book')
+        self.assertEqual(len(tried), 2)
+        self.assertIn('has no table', out[-1][1])
+
     def test_places_failure_never_invents_a_venue(self):
         def down(area, slot):
             raise OSError('network')
