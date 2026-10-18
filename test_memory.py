@@ -97,6 +97,14 @@ class MemoryTests(unittest.TestCase):
         self.assertIsNone(memory.get_persona(self.conn, 'sam'))
         self.assertIsNone(memory.get_contact(self.conn, 'sam'))
 
+    def test_sessions_round_trip_and_find_invites(self):
+        self.assertIsNone(memory.get_session(self.conn, 'g'))
+        memory.save_session(self.conn, 'g', {'answers': {'maya': 'in', 'sam': 'asked'}, 'slot': 'x'})
+        memory.save_session(self.conn, 'g', {'answers': {'maya': 'in', 'sam': 'asked'}, 'slot': 'y'})
+        self.assertEqual(memory.get_session(self.conn, 'g')['slot'], 'y')
+        self.assertEqual(memory.invited_session(self.conn, 'sam')['slot'], 'y')
+        self.assertIsNone(memory.invited_session(self.conn, 'maya'))
+
     def test_seed_demo(self):
         memory.seed_demo(self.conn)
         self.assertEqual(memory.group_members(self.conn, 'demo'), ['jordan', 'maya', 'sam'])
