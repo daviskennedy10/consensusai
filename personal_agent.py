@@ -64,6 +64,8 @@ plans = {}
 latest_status = {}
 # Counteroffers awaiting the owner of THIS personal agent.
 pending_counteroffers = {}
+# Negotiations coordinated by THIS agent.
+negotiations = {}
 
 # Give humans three minutes to respond during the demo.
 NEGOTIATION_TIMEOUT = 180
@@ -193,9 +195,18 @@ async def begin_round(ctx, plan):
                 exc,
             )
 
+async def end_negotiation(ctx, plan_id, message):
+    negotiation = negotiations.pop(plan_id, None)
+    plan = plans.pop(plan_id, None)
+
+    if plan is None:
+        return
+
+    latest_status[plan.user] = message
+    await reply(ctx, plan.user, message)
 
 async def finalize_peer_plan(ctx, plan):
-    # Prevent the same plan from being finalized twice.
+    # Prevent duplicate finalization.
     if plan.finalizing:
         return
 
@@ -207,34 +218,28 @@ async def finalize_peer_plan(ctx, plan):
         "FINALIZING plan=%s missing=%s recipient=%s",
         plan.id,
         missing,
-        plan.user
+        plan.user,
     )
 
-    # -------------------------------------------------------
-    # CASE 1: One or more personal agents did not respond.
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # CASE 1: One or more agents did not respond.
+    # --------------------------------------------------
     if missing:
-        plans.pop(plan.id, None)
-
         message = (
             f"INCOMPLETE: Plan {plan.id}. "
             f"Missing responses from {', '.join(missing)}. "
             "No group decision was made."
         )
 
+        plans.pop(plan.id, None)
         latest_status[plan.user] = message
 
         await reply(ctx, plan.user, message)
-
-        ctx.logger.info(
-            "FINISHED incomplete-plan notification for %s",
-            plan.id
-        )
         return
 
-    # -------------------------------------------------------
-    # CASE 2: Validate all agents' scores.
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # CASE 2: Validate the collected scores.
+    # --------------------------------------------------
     table = build_complete_table(
         plan.replies,
         plan.candidates,
@@ -242,24 +247,24 @@ async def finalize_peer_plan(ctx, plan):
     )
 
     if table is None:
-        plans.pop(plan.id, None)
-
         message = (
             f"INCOMPLETE: Plan {plan.id}. "
-            "An agent returned invalid or partial scores. "
+            "Invalid or partial agent scores. "
             "No group decision was made."
         )
 
+        plans.pop(plan.id, None)
         latest_status[plan.user] = message
+
         await reply(ctx, plan.user, message)
         return
 
-    # -------------------------------------------------------
-    # CASE 3: No restaurant satisfies everyone's deal breakers.
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # CASE 3: No feasible restaurant.
+    # --------------------------------------------------
     if not table:
 
-        # First try widening the search to additional dates.
+        # First, try a wider date search.
         if plan.round == 1:
             plan.round = 2
 
@@ -267,70 +272,174 @@ async def finalize_peer_plan(ctx, plan):
                 ctx,
                 plan.user,
                 "All candidates were vetoed. "
-                "Trying an additional date without relaxing deal breakers."
+                "Trying an additional date without "
+                "relaxing deal breakers.",
             )
 
             await begin_round(ctx, plan)
             return
 
-        # Both search rounds have failed.
-        # Ask the negotiation engine for possible compromises.
+        # Do not repeatedly negotiate the same plan.
+        # A completed approval triggers one fresh scoring pass.
+        if getattr(plan, "negotiation_attempted", False):
+            message = (
+                f"NO FEASIBLE PLAN: {plan.id}. "
+                "The group still has no unanimously feasible "
+                "option after re-evaluation. "
+                "No restaurant was selected."
+            )
+
+            negotiations.pop(plan.id, None)
+            plans.pop(plan.id, None)
+            latest_status[plan.user] = message
+
+            await reply(ctx, plan.user, message)
+            return
+
+        # Find candidates vetoed by the fewest people.
+        misses = near_misses(plan.replies, limit=3)
+
+        # For this first implementation, negotiate only
+        # a candidate blocked by exactly one person.
+        single_blocker_ids = {
+            miss.candidate_id
+            for miss in misses
+            if len(miss.blockers) == 1
+        }
+
         offers = counteroffers(
             plan.replies,
             plan.candidates,
             limit=3,
         )
 
-        lines = [
-            f"NO FEASIBLE GROUP PLAN: {plan.id}",
-            "All available options violate at least "
-            "one participant's deal breakers.",
-            "No constraints have been changed.",
-        ]
+        offer = next(
+            (
+                item
+                for item in offers
+                if item.candidate_id in single_blocker_ids
+                and item.person != name
+            ),
+            None,
+        )
 
-        if offers:
-            lines.append("")
-            lines.append(
-                "Possible compromises requiring human approval:"
+        if offer is None:
+            message = (
+                f"NO FEASIBLE PLAN: {plan.id}. "
+                "No suitable single-person counteroffer "
+                "was found. No constraints were relaxed "
+                "and no group decision was made."
             )
 
-            for offer in offers:
-                lines.append(
-                    f"- {offer.person}: {offer.question}"
-                )
-        else:
-            lines.append("")
-            lines.append(
-                "No safe negotiable counteroffers were identified."
+            plans.pop(plan.id, None)
+            latest_status[plan.user] = message
+
+            await reply(ctx, plan.user, message)
+            return
+
+        candidate = next(
+            (
+                c for c in plan.candidates
+                if c.id == offer.candidate_id
+            ),
+            None,
+        )
+
+        if candidate is None:
+            message = (
+                f"NEGOTIATION ERROR: Plan {plan.id}. "
+                "The proposed restaurant could not be found."
             )
 
-        message = "\n".join(lines)
+            plans.pop(plan.id, None)
+            latest_status[plan.user] = message
+
+            await reply(ctx, plan.user, message)
+            return
+
+        # Keep the session alive while awaiting
+        # approval from the affected person's agent.
+        negotiations[plan.id] = {
+            "person": offer.person,
+            "candidate_id": candidate.id,
+            "started": time.monotonic(),
+            "status": "requested",
+        }
+
+        # Hold the plan open; it is no longer
+        # waiting for ordinary scoring responses.
+        ctx.logger.info(
+            "NEGOTIATING plan=%s participant=%s candidate=%s",
+            plan.id,
+            offer.person,
+            candidate.id,
+        )
+
+        try:
+            await ctx.send(
+                ADDR[offer.person],
+                CounterofferRequest(
+                    plan_id=plan.id,
+                    candidate=candidate,
+                    category=offer.category,
+                ),
+            )
+
+        except Exception:
+            ctx.logger.exception(
+                "Failed to send counteroffer for plan %s",
+                plan.id,
+            )
+
+            await end_negotiation(
+                ctx,
+                plan.id,
+                f"NEGOTIATION FAILED: Plan {plan.id}. "
+                "The counteroffer could not be sent.",
+            )
+            return
+
+        message = (
+            f"NEGOTIATION STARTED: Plan {plan.id}.\n"
+            f"No restaurant satisfies everyone's "
+            f"current hard constraints.\n"
+            f"Asked {offer.person}'s personal agent "
+            f"to review a private counteroffer.\n"
+            "Waiting for a response. "
+            "No preferences have been changed by the coordinator."
+        )
 
         latest_status[plan.user] = message
-        plans.pop(plan.id, None)
 
         await reply(ctx, plan.user, message)
         return
 
-    # -------------------------------------------------------
-    # CASE 4: Feasible restaurants exist.
-    # Choose the fairest option.
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # CASE 4: At least one feasible restaurant exists.
+    # --------------------------------------------------
     fair, average_choice = choose(table)
 
-    # Check whether the group might benefit from
-    # discussing alternative compromises.
+    # Generate compromise alternatives if the selected
+    # option leaves someone significantly unhappy.
     compromise = propose_compromise(table)
 
     venue_id, slot = fair.split("@", 1)
+
     venue = next(
         v for v in venues
         if v["id"] == venue_id
     )
 
     scores = table[fair]
-    lowest_person = min(scores, key=scores.get)
-    average_score = sum(scores.values()) / len(scores)
+
+    lowest_person = min(
+        scores,
+        key=scores.get,
+    )
+
+    average_score = (
+        sum(scores.values()) / len(scores)
+    )
 
     lines = [
         f"PROPOSED GROUP PLAN (coordinated by {name})",
@@ -345,21 +454,23 @@ async def finalize_peer_plan(ctx, plan):
         f"Average satisfaction: {average_score:.2f}",
     ]
 
-    # Explain why fairness differs from simply
-    # maximizing everyone's average score.
+    # Explain how fairness differs from
+    # maximizing average satisfaction.
     if average_choice != fair:
         alternative = table[average_choice]
-        weakest = min(alternative, key=alternative.get)
+        weakest = min(
+            alternative,
+            key=alternative.get,
+        )
 
         lines.append(
-            f"Highest-average alternative would leave "
+            "Highest-average alternative would leave "
             f"{weakest} at {alternative[weakest]:.2f}."
         )
 
-    # -------------------------------------------------------
-    # CASE 5: A feasible plan exists, but some people
-    # might prefer a different compromise.
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # CASE 5: Show alternative compromises if needed.
+    # --------------------------------------------------
     if compromise is not None:
         lines.append("")
         lines.append("Alternative group compromises:")
@@ -372,9 +483,9 @@ async def finalize_peer_plan(ctx, plan):
             "not approved decisions."
         )
 
-    # -------------------------------------------------------
-    # Calendar draft (no actual booking or payment).
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # CASE 6: Generate calendar draft.
+    # --------------------------------------------------
     lines.append("")
     lines.append(
         "Calendar draft: "
@@ -391,14 +502,14 @@ async def finalize_peer_plan(ctx, plan):
         "any reservation or payment."
     )
 
-    # Save the result for the STATUS command.
+    # Finish the planning session.
     message = "\n".join(lines)
-    latest_status[plan.user] = message
 
-    # Remove the finished session from active plans.
+    negotiations.pop(plan.id, None)
     plans.pop(plan.id, None)
 
-    # Send the final result to ASI:One.
+    latest_status[plan.user] = message
+
     await reply(ctx, plan.user, message)
 
 @chat.on_message(ChatMessage)
@@ -780,6 +891,70 @@ async def on_counteroffer_request(
             status="approval_required",
         ),
     )
+
+@agent.on_message(CounterofferReply)
+async def on_counteroffer_reply(
+    ctx: Context,
+    sender: str,
+    msg: CounterofferReply,
+):
+    negotiation = negotiations.get(msg.plan_id)
+    plan = plans.get(msg.plan_id)
+
+    if not negotiation or not plan:
+        return
+
+    # Verify the expected personal agent sent this response.
+    if sender != ADDR.get(negotiation["person"]):
+        ctx.logger.warning(
+            "Rejected unexpected counteroffer reply from %s",
+            sender,
+        )
+        return
+
+    if (
+        msg.persona != negotiation["person"]
+        or msg.candidate_id != negotiation["candidate_id"]
+    ):
+        return
+
+    if msg.status == "approval_required":
+        negotiation["status"] = "awaiting_human"
+        ctx.logger.info(
+            "Plan %s awaiting human approval from %s",
+            plan.id,
+            msg.persona,
+        )
+        return
+
+    if msg.status in ("rejected", "not_possible"):
+        await end_negotiation(
+            ctx,
+            plan.id,
+            f"NEGOTIATION ENDED: Plan {plan.id}. "
+            f"{msg.persona} could not approve the proposed compromise. "
+            "No group decision was made.",
+        )
+        return
+
+    if msg.status in ("approved", "already_feasible"):
+        # A fresh scoring round must use everyone's current preferences.
+        negotiations.pop(plan.id, None)
+
+        # Increment the round and reuse the last candidate set.
+        # The approved preference is now saved by the personal agent.
+        # Re-evaluate the existing round-2 candidate set.
+        plan.negotiation_attempted = True
+        await begin_round(ctx, plan)
+
+        await reply(
+            ctx,
+            plan.user,
+            f"{msg.persona}'s agent accepted the proposed "
+            "compromise. Rechecking all participants' scores.",
+        )
+
+
 @agent.on_message(ScoreReply)
 async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
     plan = plans.get(msg.plan_id)
@@ -815,13 +990,49 @@ async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
 
 
 @agent.on_interval(period=1.0)
+@agent.on_interval(period=1.0)
 async def check_plan_timeouts(ctx: Context):
+    # Expire coordinator-side negotiations.
+    for plan_id, negotiation in list(negotiations.items()):
+        if (
+            time.monotonic() - negotiation["started"]
+            >= NEGOTIATION_TIMEOUT
+        ):
+            await end_negotiation(
+                ctx,
+                plan_id,
+                f"NEGOTIATION TIMED OUT: Plan {plan_id}. "
+                "No group decision was made.",
+            )
+
+    # Expire private pending approvals.
+    for plan_id, offer in list(pending_counteroffers.items()):
+        if (
+            time.monotonic() - offer["created_at"]
+            >= NEGOTIATION_TIMEOUT
+        ):
+            pending_counteroffers.pop(plan_id, None)
+
+            await ctx.send(
+                offer["coordinator"],
+                CounterofferReply(
+                    plan_id=plan_id,
+                    persona=name,
+                    candidate_id=offer["candidate"].id,
+                    status="rejected",
+                ),
+            )
+
+    # Ordinary scoring timeout.
     for plan in list(plans.values()):
+        if plan.id in negotiations:
+            continue
+
         if not plan.finalizing and plan.expired(TIMEOUT):
             ctx.logger.warning(
                 "TIMEOUT plan=%s missing=%s",
                 plan.id,
-                plan.missing_agents()
+                plan.missing_agents(),
             )
             await finalize_peer_plan(ctx, plan)
 agent.include(chat,publish_manifest=True)
