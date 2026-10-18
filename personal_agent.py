@@ -129,6 +129,22 @@ def get_candidates(round_no):
             )
         ]
 
+    # Normal mode: every venue at every slot for this round, same as organizer.candidates().
+    return [
+        Candidate(
+            id=f"{v['id']}@{slot}",
+            name=v["name"],
+            cuisine=v["cuisine"],
+            price=v["price"],
+            distance_min=v["distance_min"],
+            rating=v["rating"],
+            tags=v["tags"],
+            slot=slot,
+        )
+        for v in venues
+        for slot in SLOTS[round_no]
+    ]
+
 
 def calendar_link(title, slot, location):
     start = datetime.fromisoformat(slot)
@@ -996,7 +1012,6 @@ async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
         await finalize_peer_plan(ctx, plan)
 
 
-@agent.on_interval(period=1.0)
 @agent.on_interval(period=1.0)
 async def check_plan_timeouts(ctx: Context):
     # Expire coordinator-side negotiations.
