@@ -32,11 +32,11 @@ class OpenHoursTests(unittest.TestCase):
 
 
 class SearchTests(unittest.TestCase):
-    def fake(self, places):
+    def fake(self, places, halal=()):
         def request(body, mask):
             if mask == 'places.location':
                 return {'places': [{'location': {'latitude': 34.0635, 'longitude': -118.4455}}]}
-            return {'places': places}
+            return {'places': list(halal if body['textQuery'].startswith('halal') else places)}
         return request
 
     def test_only_operational_and_open_venues_survive(self):
@@ -57,6 +57,10 @@ class SearchTests(unittest.TestCase):
         self.assertGreater(far.distance_min, 25)
         self.assertEqual(far.tags, ['vegetarian'])
         self.assertNotIn('halal', near.tags + far.tags)  # never assumed
+
+    def test_halal_only_from_googles_halal_search(self):
+        kept, _ = search('Westwood', SAT_7PM, self.fake([place('both'), place('plain')], halal=[place('both'), place('kabab')]))
+        self.assertEqual({c.name: c.tags for c in kept}, {'Both': ['halal'], 'Plain': [], 'Kabab': ['halal']})
 
     def test_missing_key(self):
         old = os.environ.pop('GOOGLE_PLACES_API_KEY', None)

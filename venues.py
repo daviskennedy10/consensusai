@@ -3,8 +3,9 @@
 The rule that fixes the "recommended a restaurant that closed years ago" failure: every
 candidate comes from a live Places result made at plan time, its businessStatus must be
 OPERATIONAL, and it must be open at the planned slot. Nothing is cached, and no model ever
-invents a venue. Unknown facts count against the venue: halal is never tagged (Places has
-no such field), so a halal deal breaker vetoes until a menu check proves otherwise.
+invents a venue. Unknown facts count against the venue. Places has no halal field, so halal
+is tagged only on places Google itself returns for a "halal restaurants in <area>" search;
+everything else counts as not halal.
 shortcut: price per person and travel minutes are estimates from Places' price tier and
 straight-line distance; replace with menu prices and a routes API for production.
 """
@@ -67,8 +68,9 @@ def cuisine(place):
     return t.removesuffix('_restaurant').replace('_', ' ') if t != 'restaurant' else 'restaurant'
 
 
-def to_candidate(place, slot, center):
+def to_candidate(place, slot, center, halal=False):
     tags = ['vegetarian'] if place.get('servesVegetarianFood') else []
+    tags += ['halal'] if halal else []
     return SimpleNamespace(
         id=f"{place['id']}@{slot}", name=place['displayName']['text'], cuisine=cuisine(place),
         price=PRICE_PER_PERSON.get(place.get('priceLevel'), 30), rating=float(place.get('rating') or 0),
@@ -81,6 +83,10 @@ def search(area, slot, request=http, limit=15):
     dt = datetime.fromisoformat(slot)
     center = (request({'textQuery': area, 'maxResultCount': 1}, 'places.location').get('places') or [{}])[0].get('location')
     places = request({'textQuery': f'restaurants in {area}', 'maxResultCount': limit}, FIELDS).get('places', [])
+    # shortcut: Google's halal search is listing evidence, not certification; add a menu check for production.
+    halal = request({'textQuery': f'halal restaurants in {area}', 'maxResultCount': limit}, FIELDS).get('places', [])
+    halal_ids = {p['id'] for p in halal}
+    places += [p for p in halal if p['id'] not in {q['id'] for q in places}]
     kept, dropped = [], []
     for p in places:
         name = p.get('displayName', {}).get('text', '?')
@@ -89,5 +95,5 @@ def search(area, slot, request=http, limit=15):
         elif not open_at(p.get('regularOpeningHours'), dt):
             dropped.append((name, 'closed at that time'))
         else:
-            kept.append(to_candidate(p, slot, center))
+            kept.append(to_candidate(p, slot, center, p['id'] in halal_ids))
     return kept, dropped
