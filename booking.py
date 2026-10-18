@@ -50,6 +50,7 @@ class Booking:
     notes: str = ''
     task_id: Optional[str] = None
     cost: Optional[str] = None
+    what: str = ''                   # movie label (e.g. 'to watch Primetime') for showtime checks
 
 
 def deep_link(venue, slot, party_size, city='Los Angeles'):
@@ -69,6 +70,16 @@ def dry_run_task(venue, slot, party_size, city):
             'cart or guest-details page, which only works inside this browser session.')
 
 
+def showtimes_task(theater, title, slot, city):
+    date, hhmm = slot.split('T')
+    return (f'Find showtimes for the movie "{title}" at the theater "{theater}" in {city} on {date}, within 90 minutes '
+            f'of {hhmm}, using the theater\'s site, Fandango or Google. NEVER buy tickets, NEVER enter a name, email or '
+            'card, and NEVER click purchase or checkout. Report outcome available (showtimes found near that time), '
+            'unavailable (playing that day but not near that time), or not_found (not playing there that day); '
+            'bookable_times = those showtimes; platform other; restaurant_page_url = the public page listing those '
+            'showtimes, NOT a checkout or seat-selection page.')
+
+
 def share_link(platform, page_url, slot, party_size, fallback):
     """A link a human can open on their own phone with date, time and party size filled in.
     Checkout/cart pages are tied to the agent's browser session, so they are never forwarded.
@@ -83,6 +94,8 @@ def share_link(platform, page_url, slot, party_size, fallback):
         return f"https://www.exploretock.com/{parts[0]}/search?{urllib.parse.urlencode({'date': date, 'size': party_size, 'time': hhmm})}"
     if platform == 'opentable' and host.endswith('opentable.com'):
         return f"https://{p.netloc}{p.path}?{urllib.parse.urlencode({'dateTime': slot, 'covers': party_size})}"
+    if platform == 'movie':  # showtime pages keep their query (it usually carries the date)
+        return page_url
     if platform == 'resy' and host.endswith('resy.com'):
         return f"https://resy.com{p.path}?{urllib.parse.urlencode({'date': date, 'seats': party_size})}"
     return f'https://{p.netloc}{p.path}'
@@ -99,13 +112,19 @@ def http(method, path, body=None, timeout=30):
 
 
 def check_availability(venue, slot, party_size, city='Los Angeles', request=http, sleep=time.sleep,
-                       timeout_s=TIMEOUT_S) -> Booking:
+                       timeout_s=TIMEOUT_S, what='') -> Booking:
+    """Restaurant table check, or (with `what`, a movie label) a showtime check. Never books or buys."""
     if not 1 <= int(party_size) <= 20:
         raise ValueError('party_size must be between 1 and 20')
-    link = deep_link(venue, slot, party_size, city)
-    fallback = lambda notes, task_id=None, cost=None: Booking('fallback', venue, slot, party_size, link, (), notes, task_id, cost)
+    title = what.removeprefix('to watch ').strip() if what else ''
+    if what:
+        q = urllib.parse.urlencode({'q': f"showtimes {title if title != 'a movie' else ''} {venue} {slot[:10]}"})
+        link, task_text = f'https://www.google.com/search?{q}', showtimes_task(venue, title or 'any movie', slot, city)
+    else:
+        link, task_text = deep_link(venue, slot, party_size, city), dry_run_task(venue, slot, party_size, city)
+    fallback = lambda notes, task_id=None, cost=None: Booking('fallback', venue, slot, party_size, link, (), notes, task_id, cost, what)
     try:
-        task = request('POST', '/tasks', {'task': dry_run_task(venue, slot, party_size, city), 'startUrl': link,
+        task = request('POST', '/tasks', {'task': task_text, 'startUrl': link,
                                           'maxSteps': MAX_STEPS, 'structuredOutput': RESULT_SCHEMA,
                                           'metadata': {'app': 'consensusai', 'mode': 'dry_run'}})
         task_id, waited = task['id'], 0
@@ -127,12 +146,12 @@ def check_availability(venue, slot, party_size, city='Los Angeles', request=http
         outcome = out['outcome']
     except (ValueError, KeyError, TypeError):
         return fallback('booking agent gave no readable result; finish with the link', task_id, cost)
-    page = share_link(out.get('platform'), out.get('restaurant_page_url'), slot, party_size, link)
+    page = share_link('movie' if what else out.get('platform'), out.get('restaurant_page_url'), slot, party_size, link)
     times = tuple(str(t) for t in out.get('bookable_times') or ())
     if outcome == 'available':
-        return Booking('ready', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
+        return Booking('ready', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost, what)
     if outcome == 'unavailable':
-        return Booking('unavailable', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
+        return Booking('unavailable', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost, what)
     if outcome == 'no_reservations':  # not full: there is simply nothing to book
         return Booking('walk_in', venue, slot, party_size, page, (), out.get('notes', ''), task_id, cost)
     return fallback(f"booking site {outcome}: {out.get('notes', '')}".strip(), task_id, cost)
@@ -141,6 +160,13 @@ def check_availability(venue, slot, party_size, city='Los Angeles', request=http
 def message(b: Booking) -> str:
     """Chat-ready line for the organizer."""
     when = b.slot.replace('T', ' at ')
+    if b.what:
+        if b.status == 'ready':
+            return (f"Showtimes {b.what} at {b.venue} near {when}: {', '.join(b.times) or 'see link'}. "
+                    f'Tickets are not bought; get them here: {b.link}')
+        if b.status == 'unavailable':
+            return f"No showtimes {b.what} at {b.venue} near {when}. Other times: {', '.join(b.times) or 'none'}. {b.link}"
+        return f'Could not confirm showtimes {b.what} at {b.venue} ({b.notes or "check by hand"}): {b.link}'
     if b.status == 'ready':
         near = f" Other times: {', '.join(b.times)}." if b.times else ''
         return f'A table for {b.party_size} at {b.venue} on {when} is available.{near} Not booked yet; reserve it here: {b.link}'

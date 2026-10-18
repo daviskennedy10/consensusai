@@ -61,6 +61,21 @@ class SearchTests(unittest.TestCase):
         kept, _ = search('Westwood', SAT_7PM, self.fake([place('walkin', reservable=False)]))
         self.assertIs(kept[0].reservable, False)
 
+    def test_movie_theaters_are_not_food(self):
+        seen = []
+
+        def request(body, mask):
+            seen.append(body['textQuery'])
+            return {'places': [{'location': {'latitude': 34.06, 'longitude': -118.44}}]} if mask == 'places.location' else \
+                {'places': [place('regal', primaryType='movie_theater', priceLevel=None)]}
+        kept, _ = search('Westwood', SAT_7PM, request, kind='movie theaters')
+        self.assertEqual(seen[1], 'movie theaters in Westwood')
+        self.assertEqual((kept[0].food, kept[0].price, kept[0].cuisine), (False, venues.TICKET_ESTIMATE, 'movie theater'))
+        from scoring import evaluate
+        vegan = {'hard': {'max_price': 30, 'max_distance_min': 30, 'dietary': ['halal'], 'never_cuisines': ['movie theater']},
+                 'cuisine_pref': {}, 'weights': {'cuisine': 1, 'rating': 1, 'distance': 1, 'price': 1}}
+        self.assertFalse(evaluate(vegan, kept[0])[0])  # dietary rules do not veto a cinema
+
     def test_missing_key(self):
         old = os.environ.pop('GOOGLE_PLACES_API_KEY', None)
         try:
