@@ -15,7 +15,7 @@ from scoring import evaluate
 
 BASE = Path(__file__).resolve().parent
 if len(sys.argv) != 2 or sys.argv[1] not in json.loads((BASE/'personas.json').read_text()):
-    raise SystemExit('Usage: python personal_agent.py maya|jordan|sam')
+    raise SystemExit('Usage: python personal_agent.py maya|jordan|sam|alex')
 name = sys.argv[1]
 persona = load_persona(name, BASE)
 port = persona['port']

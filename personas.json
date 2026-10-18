@@ -34,5 +34,32 @@
     },
     "cuisine_pref": {"mediterranean": 1.0, "burger": 0.6, "fusion": 0.5, "thai": 0.4},
     "weights": {"cuisine": 0.5, "rating": 0.4, "distance": 0.8, "price": 1.0}
+  },
+  "alex": {
+    "seed": "consensusai-demo-alex-seed",
+    "port": 8104,
+    "hard": {
+      "max_price": 35,
+      "max_distance_min": 25,
+      "dietary": [],
+      "free_slots": [
+        "2026-10-23T19:00",
+        "2026-10-24T19:00",
+        "2026-10-25T18:00"
+      ]
+    },
+    "cuisine_pref": {
+      "mediterranean": 0.9,
+      "fusion": 1.0,
+      "italian": 0.8,
+      "thai": 0.6,
+      "burger": 0.4
+    },
+    "weights": {
+      "cuisine": 0.8,
+      "rating": 1.0,
+      "distance": 0.5,
+      "price": 0.6
+    }
   }
 }
