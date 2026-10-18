@@ -73,7 +73,7 @@ class SearchTests(unittest.TestCase):
             return {'places': [{'location': {'latitude': 34.06, 'longitude': -118.44}}]} if mask == 'places.location' else \
                 {'places': [place('regal', primaryType='movie_theater', priceLevel=None)]}
         kept, _ = search('Westwood', SAT_7PM, request, kind='movie theaters')
-        self.assertEqual(seen[1], 'movie theaters in Westwood')
+        self.assertEqual(seen[1:], ['movie theaters in Westwood'])  # no halal search for a cinema
         self.assertEqual((kept[0].food, kept[0].price, kept[0].cuisine), (False, venues.TICKET_ESTIMATE, 'movie theater'))
         from scoring import evaluate
         vegan = {'hard': {'max_price': 30, 'max_distance_min': 30, 'dietary': ['halal'], 'never_cuisines': ['movie theater']},
