@@ -3,3 +3,6 @@ data/
 __pycache__/
 *.pyc
 .venv/
+personas.after-negotiation.json
+personas.demo-backup.json
+inspect_vetoes.py

@@ -32,3 +32,17 @@ class ScoreReply(Model):
     round: int
     persona: str
     scores: List[CandidateScore]
+
+
+class CounterofferRequest(Model):
+    plan_id: str
+    candidate: Candidate
+    category: str
+
+
+class CounterofferReply(Model):
+    plan_id: str
+    persona: str
+    candidate_id: str
+    status: str
+    # "approval_required", "not_possible", "approved", "rejected"
