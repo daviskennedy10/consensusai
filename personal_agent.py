@@ -218,6 +218,12 @@ async def begin_round(ctx, plan):
                 exc,
             )
 
+def use_plan_session(ctx, plan):
+    # ASI:One threads chat by session. A handler triggered by a peer or a timer
+    # would otherwise reply under that trigger's session, outside the user's chat.
+    ctx._session = plan.session  # uagents' ctx.send() takes no session argument
+
+
 async def end_negotiation(ctx, plan_id, message):
     negotiation = negotiations.pop(plan_id, None)
     plan = plans.pop(plan_id, None)
@@ -225,6 +231,7 @@ async def end_negotiation(ctx, plan_id, message):
     if plan is None:
         return
 
+    use_plan_session(ctx, plan)
     latest_status[plan.user] = message
     await reply(ctx, plan.user, message)
 
@@ -234,6 +241,7 @@ async def finalize_peer_plan(ctx, plan):
         return
 
     plan.finalizing = True
+    use_plan_session(ctx, plan)
 
     missing = plan.missing_agents()
 
@@ -742,6 +750,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             participants=ADDR.copy(),
             coordinator=agent.address,
         )
+        plan.session = ctx.session  # the user's ASI:One chat; see use_plan_session()
 
         plans[plan.id] = plan
 
@@ -926,6 +935,8 @@ async def on_counteroffer_reply(
 
     if not negotiation or not plan:
         return
+
+    use_plan_session(ctx, plan)
 
     # Verify the expected personal agent sent this response.
     if sender != ADDR.get(negotiation["person"]):
