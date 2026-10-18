@@ -12,6 +12,7 @@ CLI: python booking.py "Water Grill" 2026-10-24T19:00 3
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -30,7 +31,8 @@ RESULT_SCHEMA = json.dumps({
     'properties': {
         'outcome': {'type': 'string', 'enum': ['available', 'unavailable', 'no_reservations', 'not_found', 'blocked']},
         'bookable_times': {'type': 'array', 'items': {'type': 'string'}},
-        'booking_url': {'type': 'string'},
+        'platform': {'type': 'string', 'enum': ['opentable', 'tock', 'resy', 'own_site', 'other']},
+        'restaurant_page_url': {'type': 'string'},  # the venue's own page on that platform, never a checkout page
         'notes': {'type': 'string'},
     },
     'required': ['outcome'],
@@ -57,12 +59,33 @@ def deep_link(venue, slot, party_size, city='Los Angeles'):
 
 def dry_run_task(venue, slot, party_size, city):
     date, hhmm = slot.split('T')
-    return (f'Find the restaurant "{venue}" in {city} on OpenTable (or its own reservation page). '
-            f'Check whether a table for {party_size} is available on {date} at {hhmm}, and note bookable times '
-            'within 90 minutes of it. If the restaurant takes no online reservations at all (walk-in only), '
+    return (f'Find the restaurant "{venue}" in {city} on its reservation platform (OpenTable, Tock, Resy, or its '
+            f'own site). Check whether a table for {party_size} is available on {date} at {hhmm}, and note bookable '
+            'times within 90 minutes of it. If the restaurant takes no online reservations at all (walk-in only), '
             'report outcome no_reservations. This is an availability check only: NEVER enter a name, phone, email or '
-            'card, and NEVER click a final reserve, complete or confirm button. Stop on the page where a human '
-            'would enter their details, and report the outcome, the bookable times, and that page URL.')
+            'card, and NEVER click a final reserve, complete or confirm button. Report the outcome, the bookable times, '
+            'the platform, and restaurant_page_url: the public URL of the restaurant\'s own page on that platform '
+            '(e.g. https://www.exploretock.com/<restaurant> or https://www.opentable.com/r/<restaurant>), NOT a checkout, '
+            'cart or guest-details page, which only works inside this browser session.')
+
+
+def share_link(platform, page_url, slot, party_size, fallback):
+    """A link a human can open on their own phone with date, time and party size filled in.
+    Checkout/cart pages are tied to the agent's browser session, so they are never forwarded.
+    shortcut: the query formats are each platform's public deep links as far as we know; verify by tapping."""
+    p = urllib.parse.urlsplit(page_url or '')
+    if p.scheme != 'https' or not p.netloc or re.search(r'checkout|cart|guest|details|confirm', p.path, re.I):
+        return fallback
+    date, hhmm = slot.split('T')
+    parts = [x for x in p.path.split('/') if x]
+    host = p.netloc.lower()
+    if platform == 'tock' and host.endswith('exploretock.com') and parts:
+        return f"https://www.exploretock.com/{parts[0]}/search?{urllib.parse.urlencode({'date': date, 'size': party_size, 'time': hhmm})}"
+    if platform == 'opentable' and host.endswith('opentable.com'):
+        return f"https://{p.netloc}{p.path}?{urllib.parse.urlencode({'dateTime': slot, 'covers': party_size})}"
+    if platform == 'resy' and host.endswith('resy.com'):
+        return f"https://resy.com{p.path}?{urllib.parse.urlencode({'date': date, 'seats': party_size})}"
+    return f'https://{p.netloc}{p.path}'
 
 
 def http(method, path, body=None, timeout=30):
@@ -104,8 +127,7 @@ def check_availability(venue, slot, party_size, city='Los Angeles', request=http
         outcome = out['outcome']
     except (ValueError, KeyError, TypeError):
         return fallback('booking agent gave no readable result; finish with the link', task_id, cost)
-    page = out.get('booking_url') or ''
-    page = page if page.startswith('https://') else link  # only hand people an https page the agent reached
+    page = share_link(out.get('platform'), out.get('restaurant_page_url'), slot, party_size, link)
     times = tuple(str(t) for t in out.get('bookable_times') or ())
     if outcome == 'available':
         return Booking('ready', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
@@ -121,7 +143,7 @@ def message(b: Booking) -> str:
     when = b.slot.replace('T', ' at ')
     if b.status == 'ready':
         near = f" Other times: {', '.join(b.times)}." if b.times else ''
-        return f'A table for {b.party_size} at {b.venue} on {when} is available.{near} Not booked yet; confirm here: {b.link}'
+        return f'A table for {b.party_size} at {b.venue} on {when} is available.{near} Not booked yet; reserve it here: {b.link}'
     if b.status == 'walk_in':
         return f"{b.venue} doesn't take reservations: just walk in."
     if b.status == 'unavailable':

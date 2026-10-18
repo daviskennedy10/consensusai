@@ -286,7 +286,7 @@ class Service:
                 return
             yield contact, f'{walk} Checking the next option that takes reservations, {bookable[0]}... (usually 1-3 minutes)'
         else:
-            yield contact, f"Checking OpenTable for a table for {p['size']} at {top}, {when(p['slot'])}... (usually 1-3 minutes)"
+            yield contact, f"Checking reservations for {p['size']} at {top}, {when(p['slot'])}... (usually 1-3 minutes)"
         misses = []
         for i, venue in enumerate(bookable):  # fair order among venues that take reservations
             b = self.check_table(venue, p['slot'], p['size'], city=city)

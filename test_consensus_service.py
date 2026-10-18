@@ -107,7 +107,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIn('No plan yet', h.say('+1A', 'book')[0][1])
         h.say('+1A', 'plan dinner sat 7pm near Westwood')
         out = h.say('+1A', 'book')
-        self.assertIn('Checking OpenTable', out[0][1])
+        self.assertIn('Checking reservations', out[0][1])
         self.assertIn('Not booked yet', out[1][1])
         self.assertEqual(seen, [('Steakhouse', SAT, 1, 'Los Angeles')])
 
