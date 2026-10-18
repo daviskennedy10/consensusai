@@ -1,6 +1,7 @@
 """Run: python personal_agent.py maya. Configure through its ASI:One chat.
-Live venues and plain-text preferences need GOOGLE_PLACES_API_KEY and STEP_API_KEY
-in the environment (set -a; . ./.env; set +a); without them it uses venues.json and `set`."""
+Live venues, plain-text preferences, table checks and group memory need GOOGLE_PLACES_API_KEY,
+STEP_API_KEY, BROWSER_USE_API_KEY and DATABASE_URL in the environment (set -a; . ./.env; set +a).
+Each one is optional: without it the agent uses venues.json, `set`, a booking link, and local files."""
 import asyncio
 import re
 import time
@@ -29,6 +30,8 @@ from models import (
     CounterofferRequest,
     CounterofferReply,
 )
+import booking
+import fairness
 import nl_preferences
 import venues as places
 from preferences import load_persona, save_persona, validate_update
@@ -80,10 +83,45 @@ NEGOTIATION_TIMEOUT = 180
 PLAN_AREA = os.getenv("PLAN_AREA", "Westwood, Los Angeles")
 # Google Maps links for live candidates, by candidate id.
 maps_links = {}
+# Google's "takes reservations" flag for live candidates (None = unknown), by candidate id.
+reservable = {}
+# Each user's latest proposed plan, for BOOK.
+last_plans = {}
+# Plans are recorded in Tiger under the demo group that memory.seed_demo creates.
+GROUP_ID = "demo"
 if len(sys.argv) != 2 or sys.argv[1] not in json.loads((BASE/'personas.json').read_text()):
     raise SystemExit('Usage: python personal_agent.py maya|jordan|sam|alex')
 name = sys.argv[1]
 persona = load_persona(name, BASE)
+
+
+def tiger(fn, *args):
+    """Run a memory.py call on Tiger Postgres. Returns None when DATABASE_URL is unset or the
+    database fails: group memory is optional and must never block planning."""
+    if not os.getenv("DATABASE_URL"):
+        return None
+    try:
+        import memory
+        with memory.connect() as conn:
+            return fn(conn, *args)
+    except Exception as exc:
+        print(f"{name}: Tiger Postgres unavailable ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+        return None
+
+
+def remember_persona(p):
+    import memory
+    tiger(memory.save_persona, name, {k: p[k] for k in ("hard", "soft", "weights", "cuisine_pref") if k in p})
+
+
+def load_from_tiger():
+    import memory
+    tiger(lambda conn: (memory.init(conn), memory.seed_demo(conn, BASE)))
+    return tiger(memory.get_persona, name)
+
+
+# Preferences saved in Tiger win over the local file, so a fresh server keeps them.
+persona = {**persona, **(load_from_tiger() or {})}
 port = persona['port']
 agent = Agent(name=f'consensusai-{name}', seed=persona['seed'], port=port, mailbox=True)
 chat = Protocol(spec=chat_protocol_spec)
@@ -201,6 +239,7 @@ async def find_live_candidates(ctx):
 
     for c in found:
         maps_links[c.id] = c.maps_url
+        reservable[c.id] = c.reservable
 
     candidates = [
         Candidate(
@@ -527,6 +566,9 @@ async def finalize_peer_plan(ctx, plan):
     # Look the venue up in this plan's candidates: live ones are not in venues.json.
     chosen = next(c for c in plan.candidates if c.id == fair)
     slot = chosen.slot
+    last_plans[plan.user] = {"id": fair, "venue": chosen.name, "slot": slot, "size": len(plan.participants)}
+    import memory
+    await asyncio.to_thread(tiger, memory.record_plan, plan.id, GROUP_ID, fairness.decide(table))
 
     scores = table[fair]
 
@@ -637,6 +679,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         "cancel",
         "status",
         "offer",
+        "book",
     }
 
     lower_text = text.lower()
@@ -772,6 +815,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
 
             save_persona(name, BASE, updated)
             persona = updated
+            await asyncio.to_thread(remember_persona, updated)
 
         except (ValueError, TypeError) as exc:
             await reply(
@@ -799,6 +843,22 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             f"Approved compromise for plan {plan_id}. "
             "Your updated preferences have been saved.",
         )
+        return
+    if lower_text == "book":
+        target = last_plans.get(sender)
+        if not target:
+            await reply(ctx, sender, "No plan to book yet. Send plan first.")
+            return
+        when = target["slot"].replace("T", " at ")
+        if reservable.get(target["id"]) is False:
+            # Google says walk-in only: nothing to reserve, so don't spend a Browser Use check.
+            await reply(ctx, sender, f"{target['venue']} doesn't take reservations: just walk in on {when}.")
+            return
+        await reply(ctx, sender, f"Checking reservations for {target['size']} at {target['venue']}, {when}... (usually 1-3 minutes)")
+        result = await asyncio.to_thread(
+            booking.check_availability, target["venue"], target["slot"], target["size"],
+            PLAN_AREA.split(",")[-1].strip() or "Los Angeles")
+        await reply(ctx, sender, booking.message(result))
         return
     if text.lower() == "status":
         message = latest_status.get(
@@ -841,7 +901,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await begin_round(ctx, plan)
         return
     if text.lower() in ('help', 'start'):
-        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied. Do preference changes in a private chat with me: in a group chat everyone sees my replies.')
+        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied. After a plan: book checks for a real table (never books). Do preference changes in a private chat with me: in a group chat everyone sees my replies.')
     elif text.lower() == 'show':
         await reply(ctx, sender, json.dumps({'hard':persona['hard'],'weights':persona['weights'],'cuisine_pref':persona['cuisine_pref']}, indent=2))
     elif text.lower() == 'confirm':
@@ -853,6 +913,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                 updated=validate_update(persona,json.loads(pending))
                 save_persona(name, BASE, updated)
                 persona=updated
+                await asyncio.to_thread(remember_persona, updated)
                 ctx.storage.set(f'pending_{sender}','')
                 await reply(ctx, sender, 'Saved. Updated preference: '+pending)
             except (ValueError,TypeError) as e:
