@@ -32,10 +32,10 @@ from models import (
 )
 import booking
 import fairness
+import google_calendar
 import nl_preferences
 import venues as places
 from preferences import load_persona, save_persona, validate_update
-from scoring import evaluate
 
 from negotiation import (
     counteroffers,
@@ -93,6 +93,8 @@ if len(sys.argv) != 2 or sys.argv[1] not in json.loads((BASE/'personas.json').re
     raise SystemExit('Usage: python personal_agent.py maya|jordan|sam|alex')
 name = sys.argv[1]
 persona = load_persona(name, BASE)
+calendar = google_calendar.CalendarClient(BASE)
+PLAN_TIMEZONE = os.getenv('PLAN_TIMEZONE', 'America/Los_Angeles')
 
 
 def tiger(fn, *args):
@@ -280,19 +282,12 @@ async def begin_round(ctx, plan):
     # IMPORTANT:
     # The coordinating agent participates in the decision.
     # Score candidates using its own private preferences.
-    own_scores = []
-
-    for candidate in plan.candidates:
-        veto, score, reason = evaluate(persona, candidate)
-
-        own_scores.append(
-            CandidateScore(
-                candidate_id=candidate.id,
-                veto=veto,
-                score=score,
-                reason=reason,
-            )
-        )
+    # Pause the reply timer while checking the coordinator's own calendar,
+    # before peers have even received their scoring requests.
+    plan.finalizing = True
+    own_scores = await score_with_calendar(ctx, plan.candidates)
+    plan.t0 = time.monotonic()
+    plan.finalizing = False
 
     plan.replies[name] = ScoreReply(
         plan_id=plan.id,
@@ -681,6 +676,9 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         "status",
         "offer",
         "book",
+        "calendar",
+        "calendar status",
+        "calendar disconnect",
     }
 
     lower_text = text.lower()
@@ -703,6 +701,25 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
     if not allowed or sender not in allowed:
         await reply(ctx, sender, 'Preference edits disabled. Set '+name.upper()+'_OWNER_ADDRESSES to the allowed ASI:One sender address. Ask the agent operator to configure it.')
+        return
+    if lower_text in ('calendar', 'calendar status'):
+        if calendar.connected(name):
+            message = ('Google Calendar is connected locally. Planning checks your primary calendar '
+                       'for two-hour conflicts; authorization is verified during the check. '
+                       'Send calendar disconnect to revoke access.')
+        else:
+            message = (f'Google Calendar is not connected. On your computer, run '
+                       f'python google_calendar.py connect {name} --credentials data/google-oauth-client.json '
+                       'and sign in to Google. Setup: docs/google-calendar.md. '
+                       'Planning currently uses your manually entered availability.')
+        await reply(ctx, sender, message)
+        return
+    if lower_text == 'calendar disconnect':
+        try:
+            await asyncio.to_thread(calendar.disconnect, name)
+            await reply(ctx, sender, 'Google Calendar disconnected. Planning uses manual availability again.')
+        except google_calendar.CalendarError as exc:
+            await reply(ctx, sender, str(exc))
         return
         # A personal agent can initiate a group planning session.
     
@@ -902,7 +919,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await begin_round(ctx, plan)
         return
     if text.lower() in ('help', 'start'):
-        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied. After a plan: book checks for a real table (never books). Do preference changes in a private chat with me: in a group chat everyone sees my replies.')
+        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied. Calendar: calendar status | calendar disconnect. After a plan: book checks for a real table (never books). Do preference changes in a private chat with me: in a group chat everyone sees my replies.')
     elif text.lower() == 'show':
         await reply(ctx, sender, json.dumps({'hard':persona['hard'],'weights':persona['weights'],'cuisine_pref':persona['cuisine_pref']}, indent=2))
     elif text.lower() == 'confirm':
@@ -949,11 +966,24 @@ async def on_score(ctx: Context, sender: str, msg: ScoreRequest):
     if sender not in allowed_coordinators:
         ctx.logger.warning('Rejected scoring request from unrecognized organizer %s',sender)
         return
-    scores=[]
-    for c in msg.candidates:
-        veto,score,reason=evaluate(persona,c)
-        scores.append(CandidateScore(candidate_id=c.id,veto=veto,score=score,reason=reason))
+    scores = await score_with_calendar(ctx, msg.candidates)
     await ctx.send(sender,ScoreReply(plan_id=msg.plan_id,round=msg.round,persona=name,scores=scores))
+
+
+async def score_with_calendar(ctx, candidates):
+    """Use the same private availability checks for coordinator and peer scoring."""
+    try:
+        evaluations = await asyncio.to_thread(
+            google_calendar.evaluate_candidates, name, persona, candidates,
+            client=calendar, timezone_name=PLAN_TIMEZONE,
+        )
+        return [CandidateScore(candidate_id=c.id, veto=veto, score=score, reason=reason)
+                for c, (veto, score, reason) in zip(candidates, evaluations)]
+    except google_calendar.CalendarError as exc:
+        # An empty reply makes the coordinator report INCOMPLETE. A failed
+        # calendar request must never be mistaken for an empty (free) calendar.
+        ctx.logger.warning('Calendar check failed: %s', exc)
+        return []
 
 @agent.on_message(CounterofferRequest)
 async def on_counteroffer_request(
@@ -980,6 +1010,19 @@ async def on_counteroffer_request(
                 status="rejected",
             ),
         )
+        return
+
+    # A manual preference exception cannot erase a real calendar conflict.
+    try:
+        busy = await asyncio.to_thread(
+            calendar.unavailable_slots, name, [msg.candidate.slot], timezone_name=PLAN_TIMEZONE,
+        ) if calendar.connected(name) else set()
+    except google_calendar.CalendarError:
+        busy = {msg.candidate.slot}  # Unverified availability cannot be negotiated away.
+    if busy:
+        await ctx.send(sender, CounterofferReply(
+            plan_id=msg.plan_id, persona=name, candidate_id=msg.candidate.id, status='not_possible',
+        ))
         return
 
     # Calculate the smallest possible relaxation privately.

@@ -53,6 +53,15 @@ python organizer.py
 
 Chat with the organizer via ASI:One / Agentverse Mailbox. Send `PLAN` to start the **fixed** restaurant/date scenario. The agent requires all three replies. On timeout it returns `INCOMPLETE` instead of violating someone's potentially unknown deal breakers.
 
+## Google Calendar availability
+
+Personal agents can check the owner's primary Google Calendar for two-hour conflicts
+while scoring plans. Connect each owner with `python google_calendar.py connect maya`
+after configuring a Desktop OAuth client; a Google API key alone is insufficient.
+See [Calendar setup](docs/google-calendar.md). ASI:One commands: `calendar status`
+and `calendar disconnect`. A connected calendar that cannot be checked yields an
+incomplete planning result. Manual availability constraints continue to apply.
+
 ## Preference engine
 
 Pure, deterministic Python (stdlib only), so it runs and tests without agents or network.

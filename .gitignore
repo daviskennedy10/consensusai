@@ -3,6 +3,9 @@ data/
 __pycache__/
 *.pyc
 .venv/
+credentials.json
+token.json
+client_secret*.json
 personas.after-negotiation.json
 personas.demo-backup.json
 inspect_vetoes.py
