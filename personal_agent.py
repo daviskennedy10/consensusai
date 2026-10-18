@@ -841,7 +841,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await begin_round(ctx, plan)
         return
     if text.lower() in ('help', 'start'):
-        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied.')
+        await reply(ctx, sender, 'Tell me a preference in plain words, e.g. "I\'m vegetarian now and want to stay under $30", or use commands: show | set max_price 25 | set max_distance_min 20 | set dietary vegetarian,halal | set free_slots 2026-10-23T19:00,2026-10-24T19:00 | set weights {"cuisine":4,"rating":3,"distance":2,"price":1} | set cuisine_pref {"thai":1,"italian":0.5}. Send confirm before the update is applied. Do preference changes in a private chat with me: in a group chat everyone sees my replies.')
     elif text.lower() == 'show':
         await reply(ctx, sender, json.dumps({'hard':persona['hard'],'weights':persona['weights'],'cuisine_pref':persona['cuisine_pref']}, indent=2))
     elif text.lower() == 'confirm':
@@ -865,7 +865,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         # a proposal: validate_update checks it again and nothing saves without `confirm`.
         proposal = await asyncio.to_thread(nl_preferences.propose, text, persona)
         if not proposal.update:
-            problem = '; '.join(proposal.rejected[:2]) or "I didn't catch a preference there."
+            problem = '; '.join(proposal.rejected[:2]) or "No change: that already matches your preferences, or I didn't catch one."
             await reply(ctx, sender, problem + '\nSend help for examples.')
             return
         ctx.storage.set(f'pending_{sender}', json.dumps(proposal.update))
