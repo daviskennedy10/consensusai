@@ -34,6 +34,7 @@ from negotiation import (
     propose_compromise,
     minimal_relaxation,
     describe_relaxation,
+    near_misses,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -107,20 +108,26 @@ async def reply(ctx, target, message):
             target
         )
 def get_candidates(round_no):
-    return [
-        Candidate(
-            id=f"{v['id']}@{slot}",
-            name=v["name"],
-            cuisine=v["cuisine"],
-            price=v["price"],
-            distance_min=v["distance_min"],
-            rating=v["rating"],
-            tags=v["tags"],
-            slot=slot,
+    if os.getenv("NEGOTIATION_DEMO") == "1":
+        venue = next(
+            v for v in venues
+            if v["id"] == "med-grill"
         )
-        for v in venues
-        for slot in SLOTS[round_no]
-    ]
+
+        slot = "2026-10-25T18:00"
+
+        return [
+            Candidate(
+                id=f"{venue['id']}@{slot}",
+                name=venue["name"],
+                cuisine=venue["cuisine"],
+                price=venue["price"],
+                distance_min=venue["distance_min"],
+                rating=venue["rating"],
+                tags=venue["tags"],
+                slot=slot,
+            )
+        ]
 
 
 def calendar_link(title, slot, location):
