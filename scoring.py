@@ -1,7 +1,7 @@
-from statistics import mean
 from typing import Dict, Tuple
 
 import constraints
+import fairness
 import ranking
 
 def evaluate(persona: dict, c) -> Tuple[bool, float, str]:
@@ -12,10 +12,9 @@ def evaluate(persona: dict, c) -> Tuple[bool, float, str]:
     return False,round(score,3),f'score {score:.2f}, driven by {best}'
 
 def choose(table: Dict[str, Dict[str,float]]) -> Tuple[str,str]:
-    if not table: raise ValueError('No feasible candidates')
-    fair=max(table,key=lambda k:(min(table[k].values()),mean(table[k].values()),k))
-    avg=max(table,key=lambda k:(mean(table[k].values()),k))
-    return fair,avg
+    """(fair_id, average_id). Leximin refines the legacy maximin: same worst-off score, better ties."""
+    d=fairness.decide(table)
+    return d.chosen,d.average_id
 
 def valid_full_reply(reply, candidate_ids):
     ids=[s.candidate_id for s in reply.scores]
