@@ -1,18 +1,14 @@
 from statistics import mean
 from typing import Dict, Tuple
 
+import constraints
+import ranking
+
 def evaluate(persona: dict, c) -> Tuple[bool, float, str]:
-    h=persona['hard']
-    if c.slot not in h['free_slots']: return True,0.0,'not free at that time'
-    if c.price>h['max_price']: return True,0.0,'over budget'
-    if c.distance_min>h['max_distance_min']: return True,0.0,'too far'
-    if any(d not in c.tags for d in h['dietary']): return True,0.0,'dietary requirement unavailable'
-    w=persona['weights']
-    parts={'cuisine':persona['cuisine_pref'].get(c.cuisine,0.3),'rating':c.rating/5,
-           'distance':max(0,1-c.distance_min/h['max_distance_min']),
-           'price':max(0,1-c.price/h['max_price'])}
-    score=sum(w[k]*parts[k] for k in parts)/sum(w.values())
-    best=max(parts,key=lambda k:w[k]*parts[k])
+    blocked=constraints.first_violation(persona,c)
+    if blocked: return True,0.0,blocked.reason
+    score,parts=ranking.score(persona,c)
+    best=max(parts,key=parts.get)
     return False,round(score,3),f'score {score:.2f}, driven by {best}'
 
 def choose(table: Dict[str, Dict[str,float]]) -> Tuple[str,str]:
