@@ -21,6 +21,8 @@ from uuid import uuid4
 
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage, TextContent, chat_protocol_spec
+from uagents_core.types import DeliveryStatus
+from activity_trace import ActivityTrace, EventType
 
 from models import (
     Candidate,
@@ -75,6 +77,18 @@ latest_status = {}
 pending_counteroffers = {}
 # Negotiations coordinated by THIS agent.
 negotiations = {}
+
+# Retained after active-plan cleanup so owners can inspect completed activity.
+# These histories are process-local and contain only structured public events.
+activity_traces = {}
+latest_trace_id = {}
+
+
+def trace_event(plan_id, kind, actor, target=None, round=None):
+    trace = activity_traces.get(plan_id)
+    if trace is not None:
+        trace.record(kind, actor, target=target, round=round)
+
 
 # Give humans three minutes to respond during the demo.
 NEGOTIATION_TIMEOUT = 180
@@ -277,6 +291,11 @@ async def begin_round(ctx, plan):
 
     request = plan.make_request()
 
+    if getattr(plan, "negotiation_attempted", False):
+        trace_event(plan.id, EventType.RESCORING_STARTED, "system", round=plan.round)
+    elif plan.round > 1:
+        trace_event(plan.id, EventType.ROUND_RETRY, "system", round=plan.round)
+
     # IMPORTANT:
     # The coordinating agent participates in the decision.
     # Score candidates using its own private preferences.
@@ -301,6 +320,8 @@ async def begin_round(ctx, plan):
         scores=own_scores,
     )
 
+    trace_event(plan.id, EventType.SCORE_RECEIVED, name, round=plan.round)
+
     ctx.logger.info(
         "%s scored %d candidates locally",
         name,
@@ -313,7 +334,10 @@ async def begin_round(ctx, plan):
             continue
 
         try:
-            await ctx.send(address, request)
+            result = await ctx.send(address, request)
+            if result.status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERED):
+                trace_event(plan.id, EventType.SCORE_REQUESTED, name,
+                            target=peer_name, round=plan.round)
 
             ctx.logger.info(
                 "Sent plan %s to %s",
@@ -404,6 +428,7 @@ async def finalize_peer_plan(ctx, plan):
     # CASE 3: No feasible restaurant.
     # --------------------------------------------------
     if not table:
+        trace_event(plan.id, EventType.NO_FEASIBLE_PLAN, "system", round=plan.round)
 
         # First, try a wider date search.
         if plan.round == 1:
@@ -517,7 +542,7 @@ async def finalize_peer_plan(ctx, plan):
         )
 
         try:
-            await ctx.send(
+            result = await ctx.send(
                 ADDR[offer.person],
                 CounterofferRequest(
                     plan_id=plan.id,
@@ -525,6 +550,9 @@ async def finalize_peer_plan(ctx, plan):
                     category=offer.category,
                 ),
             )
+            if result.status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERED):
+                trace_event(plan.id, EventType.COUNTEROFFER_SENT, name,
+                            target=offer.person)
 
         except Exception:
             ctx.logger.exception(
@@ -648,6 +676,7 @@ async def finalize_peer_plan(ctx, plan):
     # Finish the planning session.
     message = "\n".join(lines)
 
+    trace_event(plan.id, EventType.PLAN_PROPOSED, name)
     negotiations.pop(plan.id, None)
     plans.pop(plan.id, None)
 
@@ -681,6 +710,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         "status",
         "offer",
         "book",
+        "trace",
     }
 
     lower_text = text.lower()
@@ -704,9 +734,13 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     if not allowed or sender not in allowed:
         await reply(ctx, sender, 'Preference edits disabled. Set '+name.upper()+'_OWNER_ADDRESSES to the allowed ASI:One sender address. Ask the agent operator to configure it.')
         return
-        # A personal agent can initiate a group planning session.
-    
-        # Allow the user to retrieve the latest planning result
+
+    if lower_text == "trace":
+        trace = activity_traces.get(latest_trace_id.get(sender))
+        await reply(ctx, sender, trace.render() if trace is not None
+                    else "No planning activity has been recorded yet.")
+        return
+
     # -------------------------------------------------
     # Private negotiation commands
     # -------------------------------------------------
@@ -890,6 +924,9 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         plan.live = live
 
         plans[plan.id] = plan
+        activity_traces[plan.id] = ActivityTrace(plan.id)
+        latest_trace_id[sender] = plan.id
+        trace_event(plan.id, EventType.PLAN_STARTED, name)
 
         await reply(
             ctx,
@@ -1093,8 +1130,19 @@ async def on_counteroffer_reply(
     ):
         return
 
+    if time.monotonic() - negotiation["started"] >= NEGOTIATION_TIMEOUT:
+        trace_event(plan.id, EventType.NEGOTIATION_TIMEOUT, "system")
+        await end_negotiation(
+            ctx, plan.id,
+            f"NEGOTIATION TIMED OUT: Plan {plan.id}. No group decision was made.",
+        )
+        return
+
     if msg.status == "approval_required":
+        if negotiation["status"] != "requested":
+            return
         negotiation["status"] = "awaiting_human"
+        trace_event(plan.id, EventType.APPROVAL_REQUIRED, msg.persona)
         ctx.logger.info(
             "Plan %s awaiting human approval from %s",
             plan.id,
@@ -1103,6 +1151,9 @@ async def on_counteroffer_reply(
         return
 
     if msg.status in ("rejected", "not_possible"):
+        if negotiation["status"] not in ("requested", "awaiting_human"):
+            return
+        trace_event(plan.id, EventType.REJECTED, msg.persona)
         await end_negotiation(
             ctx,
             plan.id,
@@ -1113,21 +1164,24 @@ async def on_counteroffer_reply(
         return
 
     if msg.status in ("approved", "already_feasible"):
+        if negotiation["status"] not in ("requested", "awaiting_human"):
+            return
+        if msg.status == "approved":
+            trace_event(plan.id, EventType.APPROVED, msg.persona)
         # A fresh scoring round must use everyone's current preferences.
         negotiations.pop(plan.id, None)
 
-        # Increment the round and reuse the last candidate set.
-        # The approved preference is now saved by the personal agent.
-        # Re-evaluate the existing round-2 candidate set.
+        # Keep round 2 and its cached candidates; begin_round clears old replies.
         plan.negotiation_attempted = True
         await begin_round(ctx, plan)
 
         await reply(
             ctx,
             plan.user,
-            f"{msg.persona}'s agent accepted the proposed "
-            "compromise. Rechecking all participants' scores.",
+            f"{msg.persona}'s agent completed the counteroffer review. "
+            "Rechecking all participants' scores.",
         )
+        return
 
 
 @agent.on_message(ScoreReply)
@@ -1152,6 +1206,7 @@ async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
         return
 
     plan.replies[msg.persona] = msg
+    trace_event(plan.id, EventType.SCORE_RECEIVED, msg.persona, round=plan.round)
 
     ctx.logger.info(
         "Plan %s: received %d/%d responses",
@@ -1172,6 +1227,7 @@ async def check_plan_timeouts(ctx: Context):
             time.monotonic() - negotiation["started"]
             >= NEGOTIATION_TIMEOUT
         ):
+            trace_event(plan_id, EventType.NEGOTIATION_TIMEOUT, "system")
             await end_negotiation(
                 ctx,
                 plan_id,
@@ -1208,6 +1264,8 @@ async def check_plan_timeouts(ctx: Context):
                 plan.id,
                 plan.missing_agents(),
             )
+            if plan.missing_agents():
+                trace_event(plan.id, EventType.AGENT_TIMEOUT, "system", round=plan.round)
             await finalize_peer_plan(ctx, plan)
 agent.include(chat,publish_manifest=True)
 if __name__=='__main__':
