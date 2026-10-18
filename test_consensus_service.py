@@ -124,8 +124,25 @@ class ServiceTests(unittest.TestCase):
         out = h.say('+1A', 'book')
         self.assertEqual(tried, ['Steakhouse', 'Greens'])   # fair order: top pick, then runner-up
         self.assertIn('usually 1-3 minutes', out[0][1])
-        self.assertIn('Checking the runner-up, Greens', out[1][1])
-        self.assertTrue(out[2][1].startswith('No table at Steakhouse. A table for 1 at Greens'))
+        self.assertIn('Steakhouse has no table then. Checking the runner-up, Greens', out[1][1])
+        self.assertTrue(out[2][1].startswith('Tried Steakhouse first. A table for 1 at Greens'))
+
+    def test_no_reservations_is_walk_in_not_full_and_is_remembered(self):
+        tried = []
+
+        def table(v, s, n, city):
+            tried.append(v)
+            return booking.Booking('walk_in' if v == 'Steakhouse' else 'ready', v, s, n, 'https://x', ())
+        h = Harness(table=table)
+        h.say('+1A', 'hi')
+        h.say('+1A', 'plan dinner sat 7pm')
+        out = h.say('+1A', 'book')
+        self.assertIn("Steakhouse doesn't take reservations (walk-in). Checking the runner-up, Greens", out[1][1])
+        self.assertTrue(out[2][1].startswith('Tried Steakhouse first. A table for 1 at Greens'))
+        self.assertIn('walk-in only', h.say('+1A', 'plan dinner sat 7pm')[0][1])   # remembered for the next plan
+        tried.clear()
+        h.say('+1A', 'book')
+        self.assertEqual(tried, ['Greens'])                                       # never re-checked
 
     def test_book_stops_after_two_tries(self):
         tried = []

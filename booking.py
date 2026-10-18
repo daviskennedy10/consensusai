@@ -28,7 +28,7 @@ DONE = {'finished', 'failed', 'stopped'}
 RESULT_SCHEMA = json.dumps({
     'type': 'object',
     'properties': {
-        'outcome': {'type': 'string', 'enum': ['available', 'unavailable', 'not_found', 'blocked']},
+        'outcome': {'type': 'string', 'enum': ['available', 'unavailable', 'no_reservations', 'not_found', 'blocked']},
         'bookable_times': {'type': 'array', 'items': {'type': 'string'}},
         'booking_url': {'type': 'string'},
         'notes': {'type': 'string'},
@@ -39,7 +39,7 @@ RESULT_SCHEMA = json.dumps({
 
 @dataclass(frozen=True)
 class Booking:
-    status: str                      # 'ready' (slot bookable, not booked) | 'unavailable' | 'fallback'
+    status: str                      # 'ready' (slot bookable, not booked) | 'unavailable' | 'walk_in' | 'fallback'
     venue: str
     slot: str
     party_size: int
@@ -59,7 +59,8 @@ def dry_run_task(venue, slot, party_size, city):
     date, hhmm = slot.split('T')
     return (f'Find the restaurant "{venue}" in {city} on OpenTable (or its own reservation page). '
             f'Check whether a table for {party_size} is available on {date} at {hhmm}, and note bookable times '
-            'within 90 minutes of it. This is an availability check only: NEVER enter a name, phone, email or '
+            'within 90 minutes of it. If the restaurant takes no online reservations at all (walk-in only), '
+            'report outcome no_reservations. This is an availability check only: NEVER enter a name, phone, email or '
             'card, and NEVER click a final reserve, complete or confirm button. Stop on the page where a human '
             'would enter their details, and report the outcome, the bookable times, and that page URL.')
 
@@ -110,6 +111,8 @@ def check_availability(venue, slot, party_size, city='Los Angeles', request=http
         return Booking('ready', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
     if outcome == 'unavailable':
         return Booking('unavailable', venue, slot, party_size, page, times, out.get('notes', ''), task_id, cost)
+    if outcome == 'no_reservations':  # not full: there is simply nothing to book
+        return Booking('walk_in', venue, slot, party_size, page, (), out.get('notes', ''), task_id, cost)
     return fallback(f"booking site {outcome}: {out.get('notes', '')}".strip(), task_id, cost)
 
 
@@ -119,6 +122,8 @@ def message(b: Booking) -> str:
     if b.status == 'ready':
         near = f" Other times: {', '.join(b.times)}." if b.times else ''
         return f'A table for {b.party_size} at {b.venue} on {when} is available.{near} Not booked yet; confirm here: {b.link}'
+    if b.status == 'walk_in':
+        return f"{b.venue} doesn't take reservations: just walk in."
     if b.status == 'unavailable':
         near = f" Nearby times: {', '.join(b.times)}." if b.times else ' No nearby times.'
         return f'{b.venue} has no table for {b.party_size} on {when}.{near} {b.link}'

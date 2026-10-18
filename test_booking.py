@@ -55,6 +55,12 @@ class BookingTests(unittest.TestCase):
         self.assertEqual(b.status, 'unavailable')
         self.assertIn('9:30 PM', message(b))
 
+    def test_no_reservations_means_walk_in(self):
+        b = run(FakeAPI(['finished'], {'outcome': 'no_reservations', 'notes': 'walk-in only'}))
+        self.assertEqual(b.status, 'walk_in')
+        self.assertEqual(message(b), "Water Grill doesn't take reservations: just walk in.")
+        self.assertIn('no_reservations', booking.RESULT_SCHEMA)
+
     def test_every_failure_falls_back_to_a_link(self):
         cases = {
             'network': FakeAPI(['finished'], create_error=urllib.error.URLError('down')),

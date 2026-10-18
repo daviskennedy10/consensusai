@@ -102,6 +102,7 @@ class Service:
         self.store, self.llm, self.places, self.check_table, self.now, self.rng = store, llm, places, check_table, now, rng
         self.pending = {}   # member -> proposed update. shortcut: in-process; a restart drops unconfirmed proposals.
         self.plans = {}     # group -> last plan context for BOOK / BUSY
+        self.walk_ins = set()  # venues a booking check found take no reservations (this process)
 
     # ---- helpers ----
     def name(self, member):
@@ -232,10 +233,10 @@ class Service:
         if group:
             self.store.record_plan(f'{group}-{self.rng.randrange(16**6):06x}', group, d)
         self.plans[group or member] = {'venue': c.name, 'slot': slot, 'size': len(members), 'area': area,
-                                       'options': [(by_id[cid].name, getattr(by_id[cid], 'reservable', None))
+                                       'options': [(by_id[cid].name, self.reservable(by_id[cid]))
                                                    for cid in d.ranking[:OPTIONS_KEPT]]}
         who = f'the {len(members)} of you' if len(members) > 1 else 'you'
-        res = {True: ', takes reservations', False: ', walk-in only'}.get(getattr(c, 'reservable', None), '')
+        res = {True: ', takes reservations', False: ', walk-in only'}.get(self.reservable(c), '')
         base = (f"Plan for {who}: {c.name} ({c.cuisine}, {c.rating:.1f} stars, about ${c.price} per person{res}), "
                 f"{when(slot)} near {area.split(',')[0]}.\n{d.explanation}\n"
                 f"Verified open on Google just now ({len(dropped)} closed or unverified places skipped).")
@@ -263,6 +264,9 @@ class Service:
                         f"{len(blocked[near])} person(s) ({', '.join(cats)}). Deal breakers stay private and unchanged. "
                         'Try a different area or time.')
 
+    def reservable(self, c):
+        return False if c.name in self.walk_ins else getattr(c, 'reservable', None)
+
     # ---- action ----
     def book(self, member, contact):
         group, members = self.group_or_solo(member)
@@ -286,14 +290,18 @@ class Service:
         misses = []
         for i, venue in enumerate(bookable):  # fair order among venues that take reservations
             b = self.check_table(venue, p['slot'], p['size'], city=city)
+            if b.status == 'walk_in':
+                self.walk_ins.add(venue)
             if b.status == 'ready' or i == len(bookable) - 1:
                 break
             misses.append(venue)
-            yield contact, f'No table found at {venue}. Checking the runner-up, {bookable[i + 1]}...'
-        note = f"No table at {', '.join(misses)}. " if misses and b.status == 'ready' else ''
+            why = "doesn't take reservations (walk-in)" if b.status == 'walk_in' else 'has no table then'
+            yield contact, f'{venue} {why}. Checking the runner-up, {bookable[i + 1]}...'
+        note = f"Tried {', '.join(misses)} first. " if misses and b.status == 'ready' else ''
         if top_res is False:
             note = f'{top} is walk-in only. ' + note
-        yield from self.to_all(members, note + booking.message(b), contact, member)
+        text = booking.message(b) + (f" It's verified open {when(p['slot'])}." if b.status == 'walk_in' else '')
+        yield from self.to_all(members, note + text, contact, member)
 
     def busy(self, member, contact):
         group, members = self.group_or_solo(member)
