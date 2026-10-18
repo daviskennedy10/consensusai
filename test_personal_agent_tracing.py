@@ -46,7 +46,7 @@ class FakeChatMessage(FakeModel):
         return json.dumps({"msg_id": str(self.msg_id), "content": [vars(c) for c in self.content]})
 
     def text(self):
-        return "".join(item.text for item in self.content)
+        return "".join(getattr(item, "text", "") for item in self.content)  # like uagents: skips metadata (cards)
 
 
 class FakeProtocol:
@@ -143,7 +143,7 @@ class PersonalAgentTracingTests(unittest.IsolatedAsyncioTestCase):
             "uagents_core.contrib.protocols": module("uagents_core.contrib.protocols"),
             "uagents_core.contrib.protocols.chat": module(
                 "uagents_core.contrib.protocols.chat", ChatMessage=FakeChatMessage,
-                ChatAcknowledgement=FakeModel, TextContent=FakeModel,
+                ChatAcknowledgement=FakeModel, TextContent=FakeModel, MetadataContent=FakeModel,
                 chat_protocol_spec=SimpleNamespace(digest="chat-protocol-digest")),
             "memory": self.memory, "nl_preferences": self.nl,
             "venues": self.places, "booking": self.booking,
@@ -644,6 +644,45 @@ class PersonalAgentTracingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(statuses, ["approval_required", "approved"])
         self.assertEqual(self.app.activity_traces, {})
         self.nl.propose.assert_not_called()
+
+    async def proposed_plan(self):
+        p = self.plan()
+        self.fill(p)
+        p.t0 -= self.app.TIMEOUT + 1
+        await self.app.check_plan_timeouts(self.ctx)
+        return p
+
+    async def test_proposed_plan_carries_review_card(self):
+        p = await self.proposed_plan()
+        target, message, _ = self.ctx.sent[-1]
+        self.assertEqual(target, "owner-a")
+        text, meta = message.content
+        self.assertIn("PROPOSED GROUP PLAN", text.text)          # plain text stays as the fallback
+        self.assertEqual((meta.type, meta.metadata["card_kind"], meta.metadata["card_protocol_version"]),
+                         ("metadata", "review", "1"))
+        card = json.loads(meta.metadata["card_payload"])
+        self.assertEqual(card["approve_cta"]["selection"], {"action": "approve_plan", "plan_id": p.id})
+        self.assertEqual(card["reject_cta"]["selection"], {"action": "reject_plan", "plan_id": p.id})
+        self.assertIn("Live Venue", card["title"])
+
+    async def test_review_card_approve_checks_a_table_both_reply_shapes(self):
+        p = await self.proposed_plan()
+        self.booking.check_availability.side_effect = None
+        await self.chat(json.dumps({"action": "approve_plan", "plan_id": p.id}))          # @mentioned: JSON
+        await self.chat(f"The user approved the plan {p.id} and wants a table.")         # planner: prose
+        self.assertEqual(self.booking.check_availability.call_count, 2)
+        self.assertIn("Availability only; not booked", self.ctx.texts()[-1])
+        self.nl.propose.assert_not_called()                                               # never read as a preference
+
+    async def test_review_card_reject_and_stale_plans_never_book(self):
+        p = await self.proposed_plan()
+        await self.chat(json.dumps({"action": "approve_plan", "plan_id": "deadbeef"}))
+        self.assertIn("no longer active", self.ctx.texts()[-1])
+        await self.chat(json.dumps({"action": "reject_plan", "plan_id": p.id}))
+        self.assertIn("declined. Nothing was booked", self.ctx.texts()[-1])
+        await self.chat(json.dumps({"action": "approve_plan", "plan_id": p.id}))          # already declined
+        self.assertIn("no longer active", self.ctx.texts()[-1])
+        self.booking.check_availability.assert_not_called()
 
 
 if __name__ == "__main__":
