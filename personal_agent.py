@@ -18,9 +18,23 @@ from uuid import uuid4
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage, TextContent, chat_protocol_spec
 
-from models import Candidate, CandidateScore, ScoreReply, ScoreRequest
+from models import (
+    Candidate,
+    CandidateScore,
+    ScoreReply,
+    ScoreRequest,
+    CounterofferRequest,
+    CounterofferReply,
+)
 from preferences import load_persona, parse_update, save_persona, validate_update
 from scoring import evaluate
+
+from negotiation import (
+    counteroffers,
+    propose_compromise,
+    minimal_relaxation,
+    describe_relaxation,
+)
 
 BASE = Path(__file__).resolve().parent
 # Shared demo data
@@ -176,12 +190,14 @@ async def begin_round(ctx, plan):
 
 
 async def finalize_peer_plan(ctx, plan):
+    # Prevent the same plan from being finalized twice.
     if plan.finalizing:
         return
 
     plan.finalizing = True
 
     missing = plan.missing_agents()
+
     ctx.logger.info(
         "FINALIZING plan=%s missing=%s recipient=%s",
         plan.id,
@@ -189,6 +205,9 @@ async def finalize_peer_plan(ctx, plan):
         plan.user
     )
 
+    # -------------------------------------------------------
+    # CASE 1: One or more personal agents did not respond.
+    # -------------------------------------------------------
     if missing:
         plans.pop(plan.id, None)
 
@@ -208,6 +227,9 @@ async def finalize_peer_plan(ctx, plan):
         )
         return
 
+    # -------------------------------------------------------
+    # CASE 2: Validate all agents' scores.
+    # -------------------------------------------------------
     table = build_complete_table(
         plan.replies,
         plan.candidates,
@@ -216,14 +238,23 @@ async def finalize_peer_plan(ctx, plan):
 
     if table is None:
         plans.pop(plan.id, None)
-        await reply(
-            ctx,
-            plan.user,
-            "INCOMPLETE: Invalid or partial agent scores.",
+
+        message = (
+            f"INCOMPLETE: Plan {plan.id}. "
+            "An agent returned invalid or partial scores. "
+            "No group decision was made."
         )
+
+        latest_status[plan.user] = message
+        await reply(ctx, plan.user, message)
         return
 
+    # -------------------------------------------------------
+    # CASE 3: No restaurant satisfies everyone's deal breakers.
+    # -------------------------------------------------------
     if not table:
+
+        # First try widening the search to additional dates.
         if plan.round == 1:
             plan.round = 2
 
@@ -231,27 +262,66 @@ async def finalize_peer_plan(ctx, plan):
                 ctx,
                 plan.user,
                 "All candidates were vetoed. "
-                "Trying an additional date without relaxing deal breakers.",
+                "Trying an additional date without relaxing deal breakers."
             )
 
             await begin_round(ctx, plan)
             return
 
+        # Both search rounds have failed.
+        # Ask the negotiation engine for possible compromises.
+        offers = counteroffers(
+            plan.replies,
+            plan.candidates,
+            limit=3,
+        )
+
+        lines = [
+            f"NO FEASIBLE GROUP PLAN: {plan.id}",
+            "All available options violate at least "
+            "one participant's deal breakers.",
+            "No constraints have been changed.",
+        ]
+
+        if offers:
+            lines.append("")
+            lines.append(
+                "Possible compromises requiring human approval:"
+            )
+
+            for offer in offers:
+                lines.append(
+                    f"- {offer.person}: {offer.question}"
+                )
+        else:
+            lines.append("")
+            lines.append(
+                "No safe negotiable counteroffers were identified."
+            )
+
+        message = "\n".join(lines)
+
+        latest_status[plan.user] = message
         plans.pop(plan.id, None)
 
-        await reply(
-            ctx,
-            plan.user,
-            "NO FEASIBLE PLAN: All candidates violate "
-            "at least one participant's hard constraints. "
-            "No constraints were automatically relaxed.",
-        )
+        await reply(ctx, plan.user, message)
         return
 
+    # -------------------------------------------------------
+    # CASE 4: Feasible restaurants exist.
+    # Choose the fairest option.
+    # -------------------------------------------------------
     fair, average_choice = choose(table)
 
+    # Check whether the group might benefit from
+    # discussing alternative compromises.
+    compromise = propose_compromise(table)
+
     venue_id, slot = fair.split("@", 1)
-    venue = next(v for v in venues if v["id"] == venue_id)
+    venue = next(
+        v for v in venues
+        if v["id"] == venue_id
+    )
 
     scores = table[fair]
     lowest_person = min(scores, key=scores.get)
@@ -259,6 +329,7 @@ async def finalize_peer_plan(ctx, plan):
 
     lines = [
         f"PROPOSED GROUP PLAN (coordinated by {name})",
+        f"Plan ID: {plan.id}",
         f"Restaurant: {venue['name']}",
         f"Cuisine: {venue['cuisine']}",
         f"Time: {slot}",
@@ -269,6 +340,8 @@ async def finalize_peer_plan(ctx, plan):
         f"Average satisfaction: {average_score:.2f}",
     ]
 
+    # Explain why fairness differs from simply
+    # maximizing everyone's average score.
     if average_choice != fair:
         alternative = table[average_choice]
         weakest = min(alternative, key=alternative.get)
@@ -278,6 +351,25 @@ async def finalize_peer_plan(ctx, plan):
             f"{weakest} at {alternative[weakest]:.2f}."
         )
 
+    # -------------------------------------------------------
+    # CASE 5: A feasible plan exists, but some people
+    # might prefer a different compromise.
+    # -------------------------------------------------------
+    if compromise is not None:
+        lines.append("")
+        lines.append("Alternative group compromises:")
+
+        for option in compromise.options:
+            lines.append(option.line)
+
+        lines.append(
+            "These alternatives are suggestions, "
+            "not approved decisions."
+        )
+
+    # -------------------------------------------------------
+    # Calendar draft (no actual booking or payment).
+    # -------------------------------------------------------
     lines.append("")
     lines.append(
         "Calendar draft: "
@@ -290,12 +382,20 @@ async def finalize_peer_plan(ctx, plan):
 
     lines.append(
         "This is a proposal, not a booking. "
-        "All participants must approve before any reservation or payment."
+        "All participants must approve before "
+        "any reservation or payment."
     )
 
+    # Save the result for the STATUS command.
+    message = "\n".join(lines)
+    latest_status[plan.user] = message
+
+    # Remove the finished session from active plans.
     plans.pop(plan.id, None)
 
-    await reply(ctx, plan.user, "\n".join(lines))
+    # Send the final result to ASI:One.
+    await reply(ctx, plan.user, message)
+
 @chat.on_message(ChatMessage)
 async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     global persona
@@ -423,6 +523,75 @@ async def on_score(ctx: Context, sender: str, msg: ScoreRequest):
         veto,score,reason=evaluate(persona,c)
         scores.append(CandidateScore(candidate_id=c.id,veto=veto,score=score,reason=reason))
     await ctx.send(sender,ScoreReply(plan_id=msg.plan_id,round=msg.round,persona=name,scores=scores))
+
+@agent.on_message(CounterofferRequest)
+async def on_counteroffer_request(
+    ctx: Context,
+    sender: str,
+    msg: CounterofferRequest,
+):
+    # Only known coordinating agents can request negotiations.
+    if sender not in ADDR.values():
+        ctx.logger.warning(
+            "Rejected counteroffer from unknown agent %s",
+            sender,
+        )
+        return
+
+    ctx.logger.info(
+        "Received counteroffer request for plan=%s candidate=%s",
+        msg.plan_id,
+        msg.candidate.id,
+    )
+
+    # Determine privately whether a relaxation is possible.
+    changes = minimal_relaxation(persona, msg.candidate)
+
+    if changes is None:
+        await ctx.send(
+            sender,
+            CounterofferReply(
+                plan_id=msg.plan_id,
+                persona=name,
+                candidate_id=msg.candidate.id,
+                status="not_possible",
+            ),
+        )
+        return
+
+    if not changes:
+        await ctx.send(
+            sender,
+            CounterofferReply(
+                plan_id=msg.plan_id,
+                persona=name,
+                candidate_id=msg.candidate.id,
+                status="approved",
+            ),
+        )
+        return
+
+    # A change is possible, but the human must approve it.
+    explanation = describe_relaxation(persona, changes)
+
+    ctx.logger.info(
+        "Counteroffer requires owner approval: plan=%s",
+        msg.plan_id,
+    )
+
+    await ctx.send(
+        sender,
+        CounterofferReply(
+            plan_id=msg.plan_id,
+            persona=name,
+            candidate_id=msg.candidate.id,
+            status="approval_required",
+        ),
+    )
+
+    # Do not send private constraint values to the coordinator.
+    # Do not change preferences automatically.
+    # The owner-facing approval flow will be connected next.
 
 @agent.on_message(ScoreReply)
 async def on_peer_score(ctx: Context, sender: str, msg: ScoreReply):
