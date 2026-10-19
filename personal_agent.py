@@ -20,7 +20,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from uagents import Agent, Context, Protocol
-from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage, TextContent, chat_protocol_spec
+from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage, MetadataContent, TextContent, chat_protocol_spec
 from uagents_core.types import DeliveryStatus
 from activity_trace import ActivityTrace, EventType
 
@@ -186,12 +186,50 @@ async def notify_counteroffer_owner(ctx, offer, private_message):
         ctx._session = original_session
 
 
-async def reply(ctx, target, message):
+def review_card(plan_id, venue, when, price, lowest, lowest_score):
+    """ASI:One review card: the plan plus Approve / Reject. Its selection comes back to on_chat."""
+    return {
+        "title": f"Approve this plan at {venue}?",
+        "summary_rows": [
+            {"label": "Restaurant", "value": venue},
+            {"label": "When", "value": when},
+            {"label": "Price", "value": f"about ${price} per person"},
+            {"label": "Fairness", "value": f"everyone at {lowest_score:.2f} or higher (lowest: {lowest})"},
+        ],
+        "approve_cta": {"label": "Approve and check a table", "selection": {"action": "approve_plan", "plan_id": plan_id},
+                        "primary": True},
+        "reject_cta": {"label": "Not this one", "selection": {"action": "reject_plan", "plan_id": plan_id}},
+    }
+
+
+def card_choice(text):
+    """(action, plan_id) from a review-card reply: JSON when the agent was @mentioned,
+    prose when ASI:One's planner routed it (the prose repeats the selection's plan id)."""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("action") in ("approve_plan", "reject_plan"):
+            return data["action"], str(data.get("plan_id", ""))
+    except ValueError:
+        pass
+    m = re.search(r"\b(approve_plan|reject_plan|approv\w*|reject\w*|declin\w*)\b.*?\bplan\b\W*(?:id\W*)?([0-9a-f]{8})\b"
+                  r"|\bplan\b\W*(?:id\W*)?([0-9a-f]{8})\b.*?\b(approv\w*|reject\w*|declin\w*)\b", text, re.I | re.S)
+    if not m:
+        return None
+    verb, plan_id = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+    return ("approve_plan" if verb.lower().startswith("approv") else "reject_plan"), plan_id
+
+
+async def reply(ctx, target, message, card=None):
     ctx.logger.info(
         "SENDING CHAT to=%s preview=%r",
         target,
         message[:150]
     )
+    content = [TextContent(type="text", text=message)]  # also the fallback if ASI:One rejects the card
+    if card:
+        content.append(MetadataContent(type="metadata", metadata={
+            "card_protocol_version": "1", "requires_card_interaction": "true",
+            "card_kind": "review", "card_payload": json.dumps(card)}))
 
     try:
         result = await ctx.send(
@@ -199,9 +237,7 @@ async def reply(ctx, target, message):
             ChatMessage(
                 timestamp=datetime.now(timezone.utc),
                 msg_id=uuid4(),
-                content=[
-                    TextContent(type="text", text=message)
-                ]
+                content=content
             )
         )
 
@@ -640,7 +676,8 @@ async def finalize_peer_plan(ctx, plan):
     # Look the venue up in this plan's candidates: live ones are not in venues.json.
     chosen = next(c for c in plan.candidates if c.id == fair)
     slot = chosen.slot
-    last_plans[plan.user] = {"id": fair, "venue": chosen.name, "slot": slot, "size": len(plan.participants)}
+    last_plans[plan.user] = {"id": fair, "venue": chosen.name, "slot": slot, "size": len(plan.participants),
+                             "plan_id": plan.id}
     import memory
     await asyncio.to_thread(tiger, memory.record_plan, plan.id, GROUP_ID, fairness.decide(table))
 
@@ -727,7 +764,28 @@ async def finalize_peer_plan(ctx, plan):
 
     latest_status[plan.user] = message
 
-    await reply(ctx, plan.user, message)
+    # shortcut: only the organizer's owner gets the card; per-participant approval needs each owner's ASI:One address.
+    card = review_card(plan.id, chosen.name, slot.replace("T", " at "), chosen.price,
+                       lowest_person, scores[lowest_person])
+    await reply(ctx, plan.user, message, card=card)
+
+async def run_book(ctx, sender):
+    """BOOK, or Approve on the review card: check a real table for the last plan."""
+    target = last_plans.get(sender)
+    if not target:
+        await reply(ctx, sender, "No plan to book yet. Send plan first.")
+        return
+    when = target["slot"].replace("T", " at ")
+    if reservable.get(target["id"]) is False:
+        # Google says walk-in only: nothing to reserve, so don't spend a Browser Use check.
+        await reply(ctx, sender, f"{target['venue']} doesn't take reservations: just walk in on {when}.")
+        return
+    await reply(ctx, sender, f"Checking reservations for {target['size']} at {target['venue']}, {when}... (usually 1-3 minutes)")
+    result = await asyncio.to_thread(
+        booking.check_availability, target["venue"], target["slot"], target["size"],
+        PLAN_AREA.split(",")[-1].strip() or "Los Angeles")
+    await reply(ctx, sender, booking.message(result))
+
 
 @chat.on_message(ChatMessage)
 async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
@@ -779,6 +837,19 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
     if not allowed or sender not in allowed:
         await reply(ctx, sender, 'Preference edits disabled. Set '+name.upper()+'_OWNER_ADDRESSES to the allowed ASI:One sender address. Ask the agent operator to configure it.')
+        return
+
+    choice = card_choice(text)
+    if choice:
+        action, plan_id = choice
+        target = last_plans.get(sender)
+        if not target or target.get("plan_id") != plan_id:
+            await reply(ctx, sender, "That plan is no longer active. Send plan to start a new one.")
+        elif action == "reject_plan":
+            last_plans.pop(sender, None)
+            await reply(ctx, sender, f"Plan {plan_id} declined. Nothing was booked. Send plan to start again.")
+        else:
+            await run_book(ctx, sender)
         return
 
     if lower_text == "notify here":
@@ -935,20 +1006,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         )
         return
     if lower_text == "book":
-        target = last_plans.get(sender)
-        if not target:
-            await reply(ctx, sender, "No plan to book yet. Send plan first.")
-            return
-        when = target["slot"].replace("T", " at ")
-        if reservable.get(target["id"]) is False:
-            # Google says walk-in only: nothing to reserve, so don't spend a Browser Use check.
-            await reply(ctx, sender, f"{target['venue']} doesn't take reservations: just walk in on {when}.")
-            return
-        await reply(ctx, sender, f"Checking reservations for {target['size']} at {target['venue']}, {when}... (usually 1-3 minutes)")
-        result = await asyncio.to_thread(
-            booking.check_availability, target["venue"], target["slot"], target["size"],
-            PLAN_AREA.split(",")[-1].strip() or "Los Angeles")
-        await reply(ctx, sender, booking.message(result))
+        await run_book(ctx, sender)
         return
     if text.lower() == "status":
         message = latest_status.get(
